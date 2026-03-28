@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discordapp.com/api/webhooks/1486803328766574753/lVrHREVTqTkWiKl0rL1LKx8RuGZkJdD3IE1ZXXZ1YQi9z77IEzIeesP_GKLLn5r1lxgo")
-POLL_INTERVAL_SECONDS = 30   # how often to check for corrections
+POLL_INTERVAL_SECONDS = 10   # how often to check for corrections
 DB_PATH = "corrections.db"
 
 # Stat types to monitor
@@ -203,6 +203,7 @@ def run():
 
     # snapshot[game_id][action_number] = (play_dict, first_seen_timestamp)
     snapshots = {}
+    reported_corrections = set()
 
     while True:
         live_games = get_live_scoreboard()
@@ -240,6 +241,11 @@ def run():
                 diffs = diff_plays(old_play, new_play)
 
                 for (stat, old_v, new_v) in diffs:
+                    correction_key = f"{game_id}_{pid}_{stat}_{old_v}_{new_v}"
+                    if correction_key in reported_corrections:
+                        continue
+                    reported_corrections.add(correction_key)
+
                     old_player = old_play.get("assistPlayerNameInitial")
                     new_player = new_play.get("assistPlayerNameInitial")
                     ctype, label = classify_correction(stat, old_v, new_v,
