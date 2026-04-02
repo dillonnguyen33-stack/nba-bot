@@ -30,6 +30,8 @@ COLORS = {
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Create table if it doesn't exist
     c.execute("""
         CREATE TABLE IF NOT EXISTS corrections (
             id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,10 +45,25 @@ def init_db():
             period             INTEGER,
             clock              TEXT,
             detected_at        TEXT,
-            seconds_to_correct REAL,
-            correction_key     TEXT UNIQUE
+            seconds_to_correct REAL
         )
     """)
+
+    # Migrate old database — add correction_key column if it doesn't exist
+    try:
+        c.execute("ALTER TABLE corrections ADD COLUMN correction_key TEXT")
+        conn.commit()
+        print("[db] Added correction_key column to existing database")
+    except sqlite3.OperationalError:
+        pass  # column already exists, no action needed
+
+    # Add unique index on correction_key if not already there
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_key ON corrections(correction_key)")
+        conn.commit()
+    except:
+        pass
+
     conn.commit()
     conn.close()
 
