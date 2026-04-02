@@ -2,6 +2,7 @@
 QK Bot - Kelly Criterion Calculator for NBA Player Props
 Triggers only on @sub messages in #plays channel
 Posts to #plays-qk with implied probability, EV%, and Kelly suggestion
+Uses fuzzy matching for player names
 """
 
 import os
@@ -9,12 +10,17 @@ import re
 import requests
 import discord
 from datetime import datetime
+from difflib import SequenceMatcher
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY")
 PLAYS_CHANNEL_ID  = 1461266015433396400
 QK_CHANNEL_ID     = 1488811439476183160
+SUB_ROLE_ID       = 1461266329712463914
+
+# Fuzzy match threshold — 0.0 to 1.0 (70% = 0.70)
+FUZZY_THRESHOLD = 0.70
 
 # Books used for implied probability averaging (vig-removed)
 PROB_BOOKS  = {"draftkings", "fanduel", "bet365"}
@@ -24,13 +30,6 @@ BOOK_LABELS = {
     "fanduel":    "FanDuel",
     "bet365":     "Bet365",
     "fliff":      "Fliff",
-}
-
-# ── NICKNAME DICTIONARY ───────────────────────────────────────────────────────
-NICKNAMES = {
-    "podz":   "podziemski",
-    "bron":   "lebron",
-    "dmitch": "mitchell",
 }
 
 NBA_HEADERS = {
@@ -55,19 +54,78 @@ STAT_MAP = {
 STAT_SHORT = {"assists": "AST", "points": "PTS", "rebounds": "REB"}
 STAT_EMOJI = {"assists": "🎯", "points": "🏀", "rebounds": "💪"}
 
+# ── FUZZY MATCHING ────────────────────────────────────────────────────────────
+def fuzzy_score(a, b):
+    """Return similarity ratio between two strings (0.0 to 1.0)."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def best_fuzzy_match(query, candidates):
+    """
+    Find the best fuzzy match for query among candidates.
+    candidates: list of dicts with 'name', 'first', 'last', 'full'
+    Returns (best_candidate, score) or (None, 0) if no good match.
+    """
+    query = query.lower().strip()
+    best_score = 0
+    best_match = None
+    second_score = 0
+
+    for candidate in candidates:
+        full  = candidate["full"].lower()
+        first = candidate["first"].lower()
+        last  = candidate["last"].lower()
+
+        # Score against full name, first name, last name
+        scores = [
+            fuzzy_score(query, full),
+            fuzzy_score(query, first),
+            fuzzy_score(query, last),
+            # Also check if query is contained in last name
+            1.0 if query in last else 0,
+            # Check if query is contained in full name
+            0.85 if query in full else 0,
+        ]
+        score = max(scores)
+
+        if score > best_score:
+            second_score = best_score
+            best_score   = score
+            best_match   = candidate
+        elif score > second_score:
+            second_score = score
+
+    # Only return if best score is above threshold
+    # AND clearly better than second best (avoid ambiguity)
+    if best_score >= FUZZY_THRESHOLD:
+        # If two players score very similarly, it's ambiguous
+        if best_score - second_score < 0.1 and second_score >= FUZZY_THRESHOLD:
+            print(f"[debug] Ambiguous match for '{query}': top score {best_score:.2f}, second {second_score:.2f}")
+            return None, 0
+        return best_match, best_score
+
+    return None, 0
+
 # ── PARSE PLAY ────────────────────────────────────────────────────────────────
 def parse_play(message):
     text = message.content.strip()
+    print(f"[debug] Raw message: {repr(text)}")
 
-    # Must start with @sub (mention or literal)
-    if not (text.lower().startswith("@sub") or
-            re.match(r'^<@[!&]?\d+>', text)):
+    # Check for @sub role mention or literal @sub text
+    is_sub_mention = f"<@&{SUB_ROLE_ID}>" in text
+    is_sub_text    = text.lower().startswith("@sub")
+
+    if not is_sub_mention and not is_sub_text:
+        print(f"[debug] Not a @sub message, skipping")
         return None
 
-    # Remove the @sub / mention
-    text = re.sub(r'^<@[!&]?\d+>', '', text).strip()
+    print(f"[debug] @sub detected!")
+
+    # Remove the role mention or @sub text
+    text = text.replace(f"<@&{SUB_ROLE_ID}>", "").strip()
     text = re.sub(r'^@?sub\s*', '', text, flags=re.IGNORECASE).strip()
     tl   = text.lower()
+
+    print(f"[debug] After stripping @sub: {repr(tl)}")
 
     # Units — support 1u, 1U, .5u, 0.5u, 1 u
     units_match = re.search(r'([\d.]+)\s*u\b', tl, re.IGNORECASE)
@@ -76,6 +134,7 @@ def parse_play(message):
     # Line — o5.5, u5.5, o 5.5
     line_match = re.search(r'([ou])\s*([\d.]+)', tl)
     if not line_match:
+        print(f"[debug] No line found in: {repr(tl)}")
         return None
     direction = "over" if line_match.group(1) == 'o' else "under"
     line      = float(line_match.group(2))
@@ -87,23 +146,23 @@ def parse_play(message):
             stat_type = val
             break
     if not stat_type:
+        print(f"[debug] No stat type found in: {repr(tl)}")
         return None
 
     # Player name — everything before the o/u line
     player_raw = tl[:line_match.start()].strip()
     if not player_raw:
+        print(f"[debug] No player name found")
         return None
 
-    # Apply nickname lookup
-    player_search = NICKNAMES.get(player_raw, player_raw)
+    print(f"[debug] Parsed: player='{player_raw}', line={line}, direction={direction}, stat={stat_type}, units={units}")
 
     return {
-        "player_display": player_raw.title(),
-        "player_search":  player_search,
-        "line":           line,
-        "direction":      direction,
-        "stat_type":      stat_type,
-        "units":          units,
+        "player_raw":  player_raw,
+        "line":        line,
+        "direction":   direction,
+        "stat_type":   stat_type,
+        "units":       units,
     }
 
 # ── NBA API ───────────────────────────────────────────────────────────────────
@@ -128,19 +187,20 @@ def get_boxscore(game_id):
         print(f"[boxscore error] {e}")
         return {}
 
-def find_player_stats(player_search, stat_type):
+def find_player_stats(player_raw, stat_type):
     """
-    Returns:
-      - None if no match found
-      - None if multiple matches found (ambiguous)
-      - dict if exactly one match found
+    Fuzzy match player_raw against all players in live games.
+    Returns player data dict if exactly one confident match, else None.
     """
     games = get_live_games()
     if not games:
+        print(f"[debug] No live games found")
         return None
 
-    name_lower = player_search.lower()
-    matches    = []
+    # Build candidate list from all live game players
+    all_candidates = []
+
+    game_map = {}  # player_id -> game info + stats
 
     for game in games:
         game_id   = game["gameId"]
@@ -157,39 +217,57 @@ def find_player_stats(player_search, stat_type):
 
         total_secs     = max(0, 4 - period) * 720 + time_left_period
         mins_remaining = round(total_secs / 60, 1)
+        game_code      = game.get("gameCode", "?").replace("/", " vs ")
 
         for team_key in ["homeTeam", "awayTeam"]:
             for player in game_data.get(team_key, {}).get("players", []):
-                full  = player.get("name", "").lower()
-                first = player.get("firstName", "").lower()
-                last  = player.get("familyName", "").lower()
+                full  = player.get("name", "")
+                first = player.get("firstName", "")
+                last  = player.get("familyName", "")
 
-                if (name_lower in full or
-                    name_lower in last or
-                    name_lower in first or
-                    (len(name_lower) > 3 and name_lower in f"{first} {last}")):
+                if not full:
+                    continue
 
-                    stats   = player.get("statistics", {})
-                    current = {
-                        "assists":  stats.get("assists", 0),
-                        "points":   stats.get("points", 0),
-                        "rebounds": stats.get("reboundsTotal", 0),
-                    }.get(stat_type, 0)
+                stats   = player.get("statistics", {})
+                current = {
+                    "assists":  stats.get("assists", 0),
+                    "points":   stats.get("points", 0),
+                    "rebounds": stats.get("reboundsTotal", 0),
+                }.get(stat_type, 0)
 
-                    matches.append({
-                        "name":           player.get("name", player_search.title()),
-                        "official_stat":  current,
-                        "corrected_stat": current + 1,
-                        "stat_type":      stat_type,
-                        "period":         period,
-                        "mins_remaining": mins_remaining,
-                        "game_code":      game.get("gameCode", "?").replace("/", " vs "),
-                    })
+                all_candidates.append({
+                    "full":           full,
+                    "first":          first,
+                    "last":           last,
+                    "official_stat":  current,
+                    "corrected_stat": current + 1,
+                    "stat_type":      stat_type,
+                    "period":         period,
+                    "mins_remaining": mins_remaining,
+                    "game_code":      game_code,
+                })
 
-    # Exactly 1 match = confident, 0 or 2+ = silent
-    if len(matches) == 1:
-        return matches[0]
-    return None
+    if not all_candidates:
+        print(f"[debug] No players found in live games")
+        return None
+
+    # Fuzzy match
+    best, score = best_fuzzy_match(player_raw, all_candidates)
+
+    if best is None:
+        print(f"[debug] No confident match for '{player_raw}'")
+        return None
+
+    print(f"[debug] Matched '{player_raw}' → '{best['full']}' (score: {score:.2f})")
+    return {
+        "name":           best["full"],
+        "official_stat":  best["official_stat"],
+        "corrected_stat": best["corrected_stat"],
+        "stat_type":      best["stat_type"],
+        "period":         best["period"],
+        "mins_remaining": best["mins_remaining"],
+        "game_code":      best["game_code"],
+    }
 
 # ── ODDS API ──────────────────────────────────────────────────────────────────
 def american_to_implied(odds):
@@ -205,7 +283,7 @@ def remove_vig(imp_over, imp_under):
 def american_to_decimal(odds):
     return (odds / 100 + 1) if odds > 0 else (100 / abs(odds) + 1)
 
-def get_all_book_odds(player_search, stat_type, line):
+def get_all_book_odds(player_name, stat_type, line):
     if not ODDS_API_KEY:
         return {}, None
 
@@ -230,6 +308,9 @@ def get_all_book_odds(player_search, stat_type, line):
 
     book_over  = {}
     book_under = {}
+
+    # Use last name for odds API matching
+    last_name = player_name.split()[-1].lower() if player_name else ""
 
     for event in events[:8]:
         event_id = event.get("id")
@@ -259,7 +340,7 @@ def get_all_book_odds(player_search, stat_type, line):
                     price = outcome.get("price")
                     name  = outcome.get("name", "")
 
-                    if player_search.lower() not in desc:
+                    if last_name not in desc:
                         continue
                     if abs(pt - line) > 0.26:
                         continue
@@ -274,7 +355,6 @@ def get_all_book_odds(player_search, stat_type, line):
     if not book_over:
         return {}, None
 
-    # Vig-removed avg from FD, DK, Bet365 only
     true_probs = []
     for bkey in PROB_BOOKS:
         if bkey in book_over and bkey in book_under:
@@ -321,7 +401,6 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
     stat_short = STAT_SHORT.get(play["stat_type"], "")
     stat_emoji = STAT_EMOJI.get(play["stat_type"], "📊")
 
-    # Probability line
     if adj_prob is None:
         prob_line = "⚪ Hit probability: N/A"
         ev_line   = ""
@@ -333,7 +412,6 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
         ev        = calculate_ev(adj_prob, best_odds)
         ev_line   = f"\n{'📈' if ev > 0 else '📉'} EV%: **{'+' if ev > 0 else ''}{ev}%**"
 
-    # Lines per book
     lines_rows = []
     for bkey in ["draftkings", "fanduel", "bet365", "fliff"]:
         if bkey in book_odds:
@@ -343,11 +421,10 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
             lines_rows.append(f"  {BOOK_LABELS[bkey]}: **{display}**{tag}")
 
     lines_section = (
-        f"\n📋 Lines (over {play['line']} {stat_short}):\n" + "\n".join(lines_rows)
+        f"\n📋 Lines ({play['direction']} {play['line']} {stat_short}):\n" + "\n".join(lines_rows)
         if lines_rows else "\n📋 Lines: not found on tracked books"
     )
 
-    # Kelly section
     if adj_prob and kelly_data:
         kelly_section = (
             f"\n📐 Half Kelly: **{kelly_data['half_kelly_pct']}%** of bankroll"
@@ -383,37 +460,40 @@ client = discord.Client(intents=intents)
 @client.event
 async def on_ready():
     print(f"✅ QK Bot online as {client.user}")
+    print(f"[debug] Watching channel: {PLAYS_CHANNEL_ID}")
+    print(f"[debug] Posting to channel: {QK_CHANNEL_ID}")
+    print(f"[debug] Sub role ID: {SUB_ROLE_ID}")
+    print(f"[debug] Fuzzy threshold: {FUZZY_THRESHOLD}")
 
 @client.event
 async def on_message(message):
     if message.author.bot:
         return
+
+    print(f"[debug] Message in channel {message.channel.id}: {repr(message.content[:80])}")
+
     if message.channel.id != PLAYS_CHANNEL_ID:
         return
 
     play = parse_play(message)
     if not play:
-        return  # not a valid @sub play — silent
+        return
 
-    # Find player — silent if 0 or 2+ matches
-    player_data = find_player_stats(play["player_search"], play["stat_type"])
+    player_data = find_player_stats(play["player_raw"], play["stat_type"])
     if not player_data:
-        return  # ambiguous or not found — silent
+        return
 
     qk_channel = client.get_channel(QK_CHANNEL_ID)
     if not qk_channel:
         print("[error] QK channel not found")
         return
 
-    # Get odds
     book_odds, base_prob = get_all_book_odds(
-        play["player_search"], play["stat_type"], play["line"]
+        player_data["name"], play["stat_type"], play["line"]
     )
 
-    # Adjust for +1 correction
     adj_prob = adjust_prob_for_correction(base_prob, play["line"], player_data["corrected_stat"])
 
-    # Kelly
     kelly_data = None
     if adj_prob and book_odds:
         kelly_data = kelly_criterion(adj_prob, max(book_odds.values()))
