@@ -12,7 +12,7 @@ from datetime import datetime
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discordapp.com/api/webhooks/1486803328766574753/lVrHREVTqTkWiKl0rL1LKx8RuGZkJdD3IE1ZXXZ1YQi9z77IEzIeesP_GKLLn5r1lxgo")
 POLL_INTERVAL_SECONDS = 10
-DB_PATH = "corrections.db"
+DB_PATH = os.environ.get("DB_PATH", "corrections.db")
 
 # Stat types to monitor
 WATCH_STATS = {"ast", "pts", "reb"}
@@ -30,8 +30,6 @@ COLORS = {
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Create table if it doesn't exist
     c.execute("""
         CREATE TABLE IF NOT EXISTS corrections (
             id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,27 +43,13 @@ def init_db():
             period             INTEGER,
             clock              TEXT,
             detected_at        TEXT,
-            seconds_to_correct REAL
+            seconds_to_correct REAL,
+            correction_key     TEXT UNIQUE
         )
     """)
-
-    # Migrate old database — add correction_key column if it doesn't exist
-    try:
-        c.execute("ALTER TABLE corrections ADD COLUMN correction_key TEXT")
-        conn.commit()
-        print("[db] Added correction_key column to existing database")
-    except sqlite3.OperationalError:
-        pass  # column already exists, no action needed
-
-    # Add unique index on correction_key if not already there
-    try:
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_correction_key ON corrections(correction_key)")
-        conn.commit()
-    except:
-        pass
-
     conn.commit()
     conn.close()
+    print(f"[db] Database ready: {DB_PATH}")
 
 def already_reported(correction_key):
     """Check if this correction was already posted (survives restarts)."""
@@ -79,6 +63,10 @@ def already_reported(correction_key):
 def save_correction(game_id, play_id, player, stat, old_val, new_val,
                     description, period, clock, detected_at, seconds_to_correct,
                     correction_key):
+    """
+    Save correction to database FIRST before posting to Discord.
+    Returns True if saved successfully, False if already exists.
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -91,9 +79,11 @@ def save_correction(game_id, play_id, player, stat, old_val, new_val,
               description, period, clock, detected_at, seconds_to_correct,
               correction_key))
         conn.commit()
+        conn.close()
+        return True
     except sqlite3.IntegrityError:
-        pass  # already saved, skip
-    conn.close()
+        conn.close()
+        return False  # already saved — do not post
 
 # ── NBA API ───────────────────────────────────────────────────────────────────
 HEADERS = {
@@ -174,7 +164,6 @@ def post_to_discord(game, play, old_play, correction_type, label, stat,
     player     = play.get("playerNameI", "Unknown")
     desc       = play.get("description", "")
 
-    # Build the change line — show actual player names for assists
     if stat == "ast":
         if correction_type == "mixup":
             old_name = old_play.get("assistPlayerNameInitial") or str(old_val) or "none"
@@ -259,7 +248,7 @@ def run():
                 for (stat, old_v, new_v) in diffs:
                     correction_key = f"{game_id}_{pid}_{stat}_{old_v}_{new_v}"
 
-                    # Check database — survives restarts unlike in-memory set
+                    # Check database first
                     if already_reported(correction_key):
                         continue
 
@@ -269,13 +258,9 @@ def run():
                                                        old_player, new_player)
                     elapsed = time.time() - first_seen
 
-                    print(f"  ✅ CORRECTION: {new_play.get('playerNameI','?')} "
-                          f"— {label} ({game_code})")
-
-                    post_to_discord(game, new_play, old_play, ctype, label,
-                                    stat, old_v, new_v, elapsed)
-
-                    save_correction(
+                    # ── SAVE TO DATABASE FIRST, THEN POST ──
+                    # This guarantees no duplicates even if bot crashes mid-post
+                    saved = save_correction(
                         game_id, pid,
                         new_play.get("playerNameI", "?"),
                         stat, old_v, new_v,
@@ -286,6 +271,16 @@ def run():
                         elapsed,
                         correction_key
                     )
+
+                    if not saved:
+                        # Already in database — skip posting
+                        continue
+
+                    print(f"  ✅ CORRECTION: {new_play.get('playerNameI','?')} "
+                          f"— {label} ({game_code})")
+
+                    post_to_discord(game, new_play, old_play, ctype, label,
+                                    stat, old_v, new_v, elapsed)
 
                 old_snap[pid] = (new_play, first_seen)
 
