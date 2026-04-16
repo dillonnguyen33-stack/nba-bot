@@ -1,7 +1,7 @@
 """
 MLB Pinch Hit Alert Bot
 Monitors beat reporters + general Twitter for pinch hit keywords
-Posts alerts to Discord with player lines from DK, FD, Fliff, Hard Rock, Bet365
+Posts alerts to Discord with player lines
 Requires 3+ sources within 3 minute window to fire alert
 """
 
@@ -12,12 +12,12 @@ import requests
 from datetime import datetime, timezone
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TWITTER_BEARER_TOKEN  = os.environ.get("TWITTER_BEARER_TOKEN")
-DISCORD_WEBHOOK_URL   = os.environ.get("PINCH_HIT_WEBHOOK_URL")
-ODDS_API_KEY          = os.environ.get("ODDS_API_KEY")
-POLL_INTERVAL         = 45    # seconds between checks
-ALERT_WINDOW          = 180   # seconds — 3 minute window
-MIN_SOURCES           = 3     # minimum sources to fire alert
+TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
+DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
+ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
+POLL_INTERVAL        = 60
+ALERT_WINDOW         = 180
+MIN_SOURCES          = 3
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -78,32 +78,15 @@ REPORTERS = [
     {"handle": "mi_guardado",     "team": "Giants"},
 ]
 
-REPORTER_HANDLES    = {r["handle"].lower() for r in REPORTERS}
-REPORTER_BY_HANDLE  = {r["handle"].lower(): r for r in REPORTERS}
+REPORTER_HANDLES   = {r["handle"].lower() for r in REPORTERS}
+REPORTER_BY_HANDLE = {r["handle"].lower(): r for r in REPORTERS}
 
-# ── KEYWORDS ──────────────────────────────────────────────────────────────────
 PINCH_HIT_KEYWORDS = [
-    "pinch hit",
-    "pinch hitting",
-    "pinch hitter",
-    "pinch-hit",
-    "on deck for",
-    "batting for",
-    "will bat for",
-    "coming out for",
-    "being lifted for",
-    "ph for",
+    "pinch hit", "pinch hitting", "pinch hitter", "pinch-hit",
+    "on deck for", "batting for", "will bat for",
+    "coming out for", "being lifted for", "ph for",
 ]
 
-# Top keywords for search queries (shorter = safer)
-SEARCH_KEYWORDS = [
-    "pinch hit",
-    "pinch-hit",
-    "batting for",
-    "ph for",
-]
-
-# ── ODDS API ──────────────────────────────────────────────────────────────────
 PROP_BOOKS = {
     "draftkings":  "DraftKings",
     "fanduel":     "FanDuel",
@@ -112,23 +95,16 @@ PROP_BOOKS = {
     "bet365":      "Bet365",
 }
 
-MLB_PROP_MARKETS = [
-    "batter_hits",
-    "batter_total_bases",
-    "batter_rbis",
-    "batter_home_runs",
-]
+MLB_PROP_MARKETS = ["batter_hits", "batter_total_bases", "batter_rbis", "batter_home_runs"]
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-recent_signals  = {}
-seen_tweet_ids  = set()
-posted_alerts   = set()
+recent_signals = {}
+seen_tweet_ids = set()
+posted_alerts  = set()
 
-# ── TWITTER ───────────────────────────────────────────────────────────────────
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
+# ── TWITTER ───────────────────────────────────────────────────────────────────
 def search_tweets(query, max_results=10):
-    """Search recent tweets — keep query short to avoid 400 errors."""
     try:
         r = requests.get(
             "https://api.twitter.com/2/tweets/search/recent",
@@ -143,7 +119,7 @@ def search_tweets(query, max_results=10):
             timeout=15
         )
         if r.status_code == 400:
-            print(f"[twitter 400] Query too long or invalid: {query[:80]}...")
+            print(f"[twitter 400] {query[:60]}...")
             return {}
         r.raise_for_status()
         return r.json()
@@ -151,31 +127,48 @@ def search_tweets(query, max_results=10):
         print(f"[twitter error] {e}")
         return {}
 
-def build_reporter_batches():
-    """Split reporters into small batches of 10 to keep queries short."""
-    handles = [r["handle"] for r in REPORTERS]
-    batches = []
-    for i in range(0, len(handles), 10):
-        batches.append(handles[i:i+10])
-    return batches
+def get_user_tweets(user_id, max_results=5):
+    """Pull latest tweets from a single user timeline."""
+    try:
+        r = requests.get(
+            f"https://api.twitter.com/2/users/{user_id}/tweets",
+            headers=TWITTER_HEADERS,
+            params={
+                "max_results":  max_results,
+                "tweet.fields": "created_at,text",
+            },
+            timeout=10
+        )
+        r.raise_for_status()
+        return r.json().get("data", [])
+    except:
+        return []
 
-# ── KEYWORD DETECTION ─────────────────────────────────────────────────────────
+def get_user_ids_batch(handles):
+    """Get Twitter user IDs for a list of handles."""
+    try:
+        r = requests.get(
+            "https://api.twitter.com/2/users/by",
+            headers=TWITTER_HEADERS,
+            params={"usernames": ",".join(handles)},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        return {u["username"].lower(): u["id"] for u in data.get("data", [])}
+    except Exception as e:
+        print(f"[user id error] {e}")
+        return {}
+
+# ── DETECTION ─────────────────────────────────────────────────────────────────
 def contains_keyword(text):
     tl = text.lower()
     return any(kw in tl for kw in PINCH_HIT_KEYWORDS)
-
-def matched_keyword(text):
-    tl = text.lower()
-    for kw in PINCH_HIT_KEYWORDS:
-        if kw in tl:
-            return kw
-    return ""
 
 def extract_player(text):
     patterns = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch[- ]hit',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?batting\s+for',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?on\s+deck\s+for',
         r'(?:ph|pinch[- ]hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?coming\s+out',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:being\s+)?lifted',
@@ -193,249 +186,211 @@ def find_common_player(signals):
     counts = {}
     for p in players:
         counts[p.lower()] = counts.get(p.lower(), 0) + 1
-    best = max(counts, key=counts.get)
-    return best.title() if counts[best] >= 1 else None
+    return max(counts, key=counts.get).title()
 
-# ── ODDS API ──────────────────────────────────────────────────────────────────
+# ── ODDS ──────────────────────────────────────────────────────────────────────
 def get_player_lines(player_name):
     if not ODDS_API_KEY or not player_name:
         return {}
-
     last_name = player_name.split()[-1].lower()
-    results   = {}
-
+    results = {}
     try:
         events = requests.get(
             "https://api.the-odds-api.com/v4/sports/baseball_mlb/events",
-            params={"apiKey": ODDS_API_KEY},
-            timeout=10
+            params={"apiKey": ODDS_API_KEY}, timeout=10
         ).json()
-    except Exception as e:
-        print(f"[odds error] {e}")
+    except:
         return {}
-
-    for event in events[:8]:
+    for event in events[:6]:
         event_id = event.get("id")
         for market in MLB_PROP_MARKETS:
             try:
                 r = requests.get(
                     f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{event_id}/odds",
-                    params={
-                        "apiKey":     ODDS_API_KEY,
-                        "markets":    market,
-                        "bookmakers": ",".join(PROP_BOOKS.keys()),
-                        "oddsFormat": "american",
-                        "regions":    "us,us2",
-                    },
+                    params={"apiKey": ODDS_API_KEY, "markets": market,
+                            "bookmakers": ",".join(PROP_BOOKS.keys()),
+                            "oddsFormat": "american", "regions": "us,us2"},
                     timeout=10
                 ).json()
             except:
                 continue
-
-            for bookmaker in r.get("bookmakers", []):
-                bkey  = bookmaker.get("key", "")
-                bname = PROP_BOOKS.get(bkey)
+            for bk in r.get("bookmakers", []):
+                bname = PROP_BOOKS.get(bk.get("key", ""))
                 if not bname:
                     continue
-                for mkt in bookmaker.get("markets", []):
-                    for outcome in mkt.get("outcomes", []):
-                        desc  = outcome.get("description", "").lower()
-                        if last_name not in desc:
+                for mkt in bk.get("markets", []):
+                    for oc in mkt.get("outcomes", []):
+                        if last_name not in oc.get("description", "").lower():
                             continue
-                        if outcome.get("name") != "Under":
+                        if oc.get("name") != "Under":
                             continue
-                        point = outcome.get("point")
-                        price = outcome.get("price")
-                        if point is None or price is None:
+                        pt, pr = oc.get("point"), oc.get("price")
+                        if pt is None or pr is None:
                             continue
                         label = market.replace("batter_", "").replace("_", " ").title()
-                        key   = f"{bname}_{label}"
+                        key = f"{bname}_{label}"
                         if key not in results:
-                            results[key] = {"book": bname, "market": label,
-                                            "line": point, "under": price}
+                            results[key] = {"book": bname, "market": label, "line": pt, "under": pr}
     return results
 
 def format_lines(lines_data):
     if not lines_data:
-        return "📋 Lines: not found on tracked books"
+        return "📋 Lines: not found"
     by_market = {}
-    for data in lines_data.values():
-        mkt = data["market"]
-        if mkt not in by_market:
-            by_market[mkt] = []
-        odds_str = f"+{data['under']}" if data["under"] > 0 else str(data["under"])
-        by_market[mkt].append(f"{data['book']}: u{data['line']} ({odds_str})")
-    lines = ["📋 **Player lines — BET UNDER:**"]
-    for market, entries in by_market.items():
-        lines.append(f"**{market}:** " + " | ".join(entries))
-    return "\n".join(lines)
+    for d in lines_data.values():
+        by_market.setdefault(d["market"], []).append(
+            f"{d['book']}: u{d['line']} ({'+'if d['under']>0 else ''}{d['under']})"
+        )
+    out = ["📋 **BET UNDER — player lines:**"]
+    for mkt, entries in by_market.items():
+        out.append(f"**{mkt}:** " + " | ".join(entries))
+    return "\n".join(out)
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def post_alert(team, signals, player_name, lines_data):
     if not DISCORD_WEBHOOK_URL:
-        print(f"[discord] No webhook — would post: {team} {player_name}")
         return
-
-    num_sources    = len(signals)
-    reporter_count = sum(1 for s in signals if s["is_reporter"])
-    general_count  = num_sources - reporter_count
-
-    source_lines = []
-    for s in signals[:4]:
-        label = "🎙️ Beat reporter" if s["is_reporter"] else "🌐 Twitter"
-        source_lines.append(
-            f"{label} **@{s['handle']}:** _{s['text'][:100]}_\n🔗 [Tweet]({s['url']})"
-        )
-
-    player_line  = f"\n👤 **Player:** {player_name}" if player_name else ""
-    sources_text = "\n\n".join(source_lines)
-    lines_text   = format_lines(lines_data)
-
-    embed = {
-        "embeds": [{
-            "title": f"⚾🚨 PINCH HIT ALERT — {team}",
-            "description": (
-                f"**{num_sources} sources confirmed** "
-                f"({reporter_count} beat reporters + {general_count} general)\n"
-                f"{player_line}\n\n"
-                f"{sources_text}\n\n"
-                f"{lines_text}\n\n"
-                f"💰 **BET THE UNDER ON ALL LINES NOW**"
-            ),
-            "color": 0x00FF00,
-            "footer": {"text": f"Pinch Hit Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}
-        }]
-    }
-
+    rc = sum(1 for s in signals if s["is_reporter"])
+    gc = len(signals) - rc
+    src = "\n\n".join(
+        f"{'🎙️ Reporter' if s['is_reporter'] else '🌐 Twitter'} **@{s['handle']}:** "
+        f"_{s['text'][:100]}_\n🔗 [Tweet]({s['url']})"
+        for s in signals[:4]
+    )
+    embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
+        "description": (
+            f"**{len(signals)} sources** ({rc} reporters + {gc} general)\n"
+            f"{f'👤 **Player:** {player_name}' if player_name else ''}\n\n"
+            f"{src}\n\n{format_lines(lines_data)}\n\n💰 **BET THE UNDER NOW**"
+        ),
+        "color": 0x00FF00,
+        "footer": {"text": f"Pinch Hit Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=embed, timeout=10)
-        r.raise_for_status()
-        print(f"  ✅ Alert posted: {team} — {num_sources} sources — {player_name}")
+        requests.post(DISCORD_WEBHOOK_URL, json=embed, timeout=10).raise_for_status()
+        print(f"  ✅ Alert: {team} — {len(signals)} sources — {player_name}")
     except Exception as e:
         print(f"[discord error] {e}")
 
-# ── PROCESS TWEETS ────────────────────────────────────────────────────────────
-def process_response(data):
-    tweets = data.get("data", [])
-    users  = {u["id"]: u["username"].lower()
-              for u in data.get("includes", {}).get("users", [])}
-    now    = datetime.now(timezone.utc).timestamp()
+# ── PROCESS ───────────────────────────────────────────────────────────────────
+def process_tweets(tweets, users):
+    now = datetime.now(timezone.utc).timestamp()
     new_signals = []
-
     for tweet in tweets:
-        tweet_id   = tweet["id"]
-        tweet_text = tweet.get("text", "")
-        author_id  = tweet.get("author_id", "")
-        handle     = users.get(author_id, "unknown")
+        tid  = tweet.get("id") or tweet.get("tweet_id", "")
+        text = tweet.get("text", "")
+        aid  = tweet.get("author_id", "")
+        handle = users.get(aid, tweet.get("handle", "unknown")).lower()
 
-        if tweet_id in seen_tweet_ids:
+        if tid in seen_tweet_ids:
             continue
-        seen_tweet_ids.add(tweet_id)
+        seen_tweet_ids.add(tid)
 
-        if not contains_keyword(tweet_text):
+        if not contains_keyword(text):
             continue
 
         is_reporter = handle in REPORTER_HANDLES
         reporter    = REPORTER_BY_HANDLE.get(handle)
         team        = reporter["team"] if reporter else None
-        player      = extract_player(tweet_text)
-        tweet_url   = f"https://twitter.com/{handle}/status/{tweet_id}"
+        player      = extract_player(text)
+        url         = f"https://twitter.com/{handle}/status/{tid}"
 
         new_signals.append({
-            "handle":      handle,
-            "text":        tweet_text,
-            "url":         tweet_url,
-            "player":      player,
-            "team":        team,
-            "is_reporter": is_reporter,
-            "timestamp":   now,
+            "handle": handle, "text": text, "url": url,
+            "player": player, "team": team,
+            "is_reporter": is_reporter, "timestamp": now,
         })
-
-        print(f"  📡 Signal: @{handle} ({'reporter' if is_reporter else 'general'}) "
-              f"team={team} player={player}")
+        print(f"  📡 @{handle} ({'rep' if is_reporter else 'gen'}) team={team} player={player}")
 
     return new_signals
 
 def check_and_alert():
     now = datetime.now(timezone.utc).timestamp()
     for team in list(recent_signals.keys()):
-        recent_signals[team] = [
-            s for s in recent_signals[team]
-            if now - s["timestamp"] <= ALERT_WINDOW
-        ]
+        recent_signals[team] = [s for s in recent_signals[team]
+                                 if now - s["timestamp"] <= ALERT_WINDOW]
         active = recent_signals[team]
         if len(active) < MIN_SOURCES:
             continue
-
-        player      = find_common_player(active)
-        time_bucket = int(now / ALERT_WINDOW)
-        alert_key   = f"{team}_{player}_{time_bucket}"
-
-        if alert_key in posted_alerts:
+        player = find_common_player(active)
+        key    = f"{team}_{player}_{int(now / ALERT_WINDOW)}"
+        if key in posted_alerts:
             continue
-        posted_alerts.add(alert_key)
+        posted_alerts.add(key)
+        post_alert(team, active, player, get_player_lines(player) if player else {})
 
-        lines_data = get_player_lines(player) if player else {}
-        post_alert(team, active, player, lines_data)
+def add_signals(new_signals):
+    for s in new_signals:
+        team = s["team"]
+        if not team:
+            tl = s["text"].lower()
+            for r in REPORTERS:
+                if r["team"].lower() in tl:
+                    team = r["team"]
+                    s["team"] = team
+                    break
+        if not team:
+            continue
+        recent_signals.setdefault(team, []).append(s)
 
-# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot started!")
-    print(f"   Monitoring {len(REPORTERS)} beat reporters")
-    print(f"   Alert threshold: {MIN_SOURCES}+ sources within {ALERT_WINDOW}s")
-    print(f"   Polling every {POLL_INTERVAL}s\n")
+    print(f"⚾ MLB Pinch Hit Bot started! {len(REPORTERS)} reporters, "
+          f"threshold={MIN_SOURCES}, window={ALERT_WINDOW}s\n")
 
     if not TWITTER_BEARER_TOKEN:
         print("[error] TWITTER_BEARER_TOKEN not set!")
         return
 
-    reporter_batches = build_reporter_batches()
-    print(f"   Reporter batches: {len(reporter_batches)} groups of ~10\n")
-
-    # Build keyword part (short)
-    kw_part = " OR ".join([f'"{kw}"' for kw in SEARCH_KEYWORDS])
+    # Get user IDs for all reporters (needed for timeline approach)
+    print("Looking up reporter user IDs...")
+    handles = [r["handle"] for r in REPORTERS]
+    user_ids = {}
+    for i in range(0, len(handles), 100):
+        batch = handles[i:i+100]
+        ids = get_user_ids_batch(batch)
+        user_ids.update(ids)
+    print(f"Found {len(user_ids)} user IDs\n")
 
     cycle = 0
 
     while True:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning Twitter... (cycle {cycle})")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle}")
 
         all_new = []
 
-        # Search each reporter batch separately to keep queries short
-        for batch in reporter_batches:
-            handles_part = " OR ".join([f"from:{h}" for h in batch])
-            query = f"({kw_part}) ({handles_part}) -is:retweet lang:en"
-            data  = search_tweets(query, max_results=10)
-            signals = process_response(data)
-            all_new.extend(signals)
-            time.sleep(1)  # small delay between batch requests
+        # APPROACH 1: General keyword search (short query, no from: filters)
+        # This catches anyone on Twitter talking about pinch hits
+        for kw in ["pinch hit", "pinch-hit"]:
+            query = f'"{kw}" baseball -is:retweet lang:en'
+            data  = search_tweets(query, max_results=15)
+            tweets = data.get("data", [])
+            users  = {u["id"]: u["username"] for u in
+                      data.get("includes", {}).get("users", [])}
+            sigs = process_tweets(tweets, users)
+            all_new.extend(sigs)
+            time.sleep(2)
 
-        # General Twitter search (no from: filter — catches non-reporter accounts)
-        general_query = f"({kw_part}) baseball mlb -is:retweet lang:en"
-        general_data  = search_tweets(general_query, max_results=15)
-        general_sigs  = process_response(general_data)
-        all_new.extend(general_sigs)
+        # APPROACH 2: Check individual reporter timelines
+        # Rotate through reporters each cycle (6 per cycle to save API calls)
+        batch_start = (cycle * 6) % len(REPORTERS)
+        batch_reporters = REPORTERS[batch_start:batch_start + 6]
 
-        # Bucket signals by team
-        for signal in all_new:
-            team = signal["team"]
-            if not team:
-                # Try to infer team from tweet text
-                text_lower = signal["text"].lower()
-                for r in REPORTERS:
-                    if r["team"].lower() in text_lower:
-                        team = r["team"]
-                        signal["team"] = team
-                        break
-            if not team:
+        for reporter in batch_reporters:
+            handle = reporter["handle"].lower()
+            uid    = user_ids.get(handle)
+            if not uid:
                 continue
+            tweets = get_user_tweets(uid, max_results=3)
+            for tweet in tweets:
+                tweet["author_id"] = uid
+            users = {uid: reporter["handle"]}
+            sigs  = process_tweets(tweets, users)
+            all_new.extend(sigs)
+            time.sleep(1)
 
-            if team not in recent_signals:
-                recent_signals[team] = []
-            recent_signals[team].append(signal)
-
+        add_signals(all_new)
         check_and_alert()
+
         cycle += 1
         time.sleep(POLL_INTERVAL)
 
