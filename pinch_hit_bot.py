@@ -21,7 +21,7 @@ import pytz
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
-POLL_INTERVAL        = 60
+POLL_INTERVAL        = 30
 ALERT_WINDOW         = 180
 MIN_SOURCES          = 3
 ET_TZ                = pytz.timezone("America/New_York")
