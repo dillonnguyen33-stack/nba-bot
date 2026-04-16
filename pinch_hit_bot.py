@@ -8,6 +8,7 @@ Upgrades:
   - Lineup check via MLB API to verify replaced player was in starting lineup
   - Confidence score shown subtly in alert
   - Daily reset of seen_tweet_ids at midnight
+  - @everyone ping on every alert
 """
 
 import os
@@ -25,8 +26,8 @@ POLL_INTERVAL        = 30
 ALERT_WINDOW         = 180
 MIN_SOURCES          = 3
 ET_TZ                = pytz.timezone("America/New_York")
-GAME_START_HOUR      = 12   # 12pm ET
-GAME_END_HOUR        = 25   # 1am ET (25 = next day 1am)
+GAME_START_HOUR      = 12
+GAME_END_HOUR        = 25
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -124,25 +125,21 @@ MLB_HEADERS = {
 }
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
-recent_signals    = {}
-seen_tweet_ids    = set()
-posted_alerts     = set()
-last_reset_date   = None   # tracks daily reset
+recent_signals  = {}
+seen_tweet_ids  = set()
+posted_alerts   = set()
+last_reset_date = None
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 # ── GAME HOURS CHECK ──────────────────────────────────────────────────────────
 def is_game_hours():
-    """Only scan between 12pm and 1am ET."""
     now_et = datetime.now(ET_TZ)
     hour   = now_et.hour
-    # 12pm (12) to midnight (23) = game hours
-    # also 0 (12am) is still fine for late west coast games
     return hour >= 12 or hour == 0
 
 # ── DAILY RESET ───────────────────────────────────────────────────────────────
 def maybe_reset_daily():
-    """Reset seen_tweet_ids at midnight ET to keep memory lean."""
     global seen_tweet_ids, last_reset_date, recent_signals
     today = datetime.now(ET_TZ).date()
     if last_reset_date is None:
@@ -156,9 +153,6 @@ def maybe_reset_daily():
 
 # ── MLB API — LINEUP CHECK ────────────────────────────────────────────────────
 def get_live_game_ids():
-    """Get all currently live MLB game IDs."""
-    url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
-    # Use MLB scoreboard instead
     mlb_url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&fields=dates,games,gamePk,status,abstractGameState"
     try:
         r = requests.get(mlb_url, timeout=10)
@@ -176,10 +170,6 @@ def get_live_game_ids():
         return []
 
 def get_starting_lineup(game_pk):
-    """
-    Fetch the starting lineup for a game.
-    Returns set of player full names (lowercase) who started.
-    """
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
     try:
         r = requests.get(url, timeout=10)
@@ -187,14 +177,11 @@ def get_starting_lineup(game_pk):
         data     = r.json()
         boxscore = data.get("liveData", {}).get("boxscore", {})
         starters = set()
-
         for side in ["home", "away"]:
             team   = boxscore.get("teams", {}).get(side, {})
             roster = team.get("players", {})
             for pid, pdata in roster.items():
-                pos = pdata.get("position", {}).get("abbreviation", "")
-                bo  = pdata.get("battingOrder", "")
-                # battingOrder set and not a sub (subs have battingOrder ending in non-0 digit after first)
+                bo = pdata.get("battingOrder", "")
                 if bo and str(bo).endswith("0"):
                     name = pdata.get("person", {}).get("fullName", "").lower()
                     if name:
@@ -205,55 +192,36 @@ def get_starting_lineup(game_pk):
         return set()
 
 def verify_in_lineup(player_name, team):
-    """
-    Check if player_name appears in any live game's starting lineup.
-    Returns True if confirmed starter, False if not found, None if can't check.
-    """
     if not player_name:
         return None
-
-    game_ids = get_live_game_ids()
+    game_ids   = get_live_game_ids()
     if not game_ids:
-        return None  # can't verify — don't penalize
-
+        return None
     name_lower = player_name.lower()
-    for game_pk in game_ids[:6]:  # check up to 6 live games
+    for game_pk in game_ids[:6]:
         starters = get_starting_lineup(game_pk)
         for starter in starters:
-            # fuzzy: check if last name matches
             if name_lower.split()[-1] in starter:
                 return True
     return False
 
 # ── CONFIDENCE SCORE ──────────────────────────────────────────────────────────
 def calculate_confidence(signals, lineup_verified):
-    """
-    Score from 1-10 based on:
-    - Number of sources (up to 5 points)
-    - Reporter vs general ratio (up to 3 points)
-    - Lineup verified (2 points)
-    """
     score = 0
-
-    # Sources
-    num = len(signals)
+    num   = len(signals)
     if num >= 5:   score += 5
     elif num >= 4: score += 4
     elif num >= 3: score += 3
     elif num >= 2: score += 2
     else:          score += 1
 
-    # Reporter ratio
     reporters = sum(1 for s in signals if s["is_reporter"])
     if reporters >= 3:   score += 3
     elif reporters >= 2: score += 2
     elif reporters >= 1: score += 1
 
-    # Lineup verified
-    if lineup_verified is True:
-        score += 2
-    elif lineup_verified is None:
-        score += 1  # can't check — neutral
+    if lineup_verified is True:   score += 2
+    elif lineup_verified is None: score += 1
 
     return min(score, 10)
 
@@ -454,7 +422,6 @@ def post_alert(team, signals, lines_data, confidence, lineup_verified):
     summary = build_summary(signals)
     conf_em = confidence_emoji(confidence)
 
-    # Lineup verification note
     if lineup_verified is True:
         lineup_note = "✅ Starter confirmed in lineup"
     elif lineup_verified is False:
@@ -462,7 +429,6 @@ def post_alert(team, signals, lines_data, confidence, lineup_verified):
     else:
         lineup_note = "❓ Lineup check unavailable"
 
-    # Source tweets (max 3, deduped by handle)
     seen_handles, src_lines = set(), []
     for s in signals:
         if s["handle"] in seen_handles:
@@ -487,7 +453,12 @@ def post_alert(team, signals, lines_data, confidence, lineup_verified):
         "color": 0x00FF00 if confidence >= 7 else 0xF1C40F,
         "footer": {"text": f"Pinch Hit Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=embed, timeout=10).raise_for_status()
+        # ── @everyone ping on every alert ─────────────────────────────────────
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": "@everyone", "embeds": embed["embeds"]},
+            timeout=10
+        ).raise_for_status()
         print(f"  ✅ Alert: {team} — {summary} (conf={confidence})")
     except Exception as e:
         print(f"[discord error] {e}")
@@ -547,13 +518,9 @@ def check_and_alert():
             continue
         posted_alerts.add(alert_key)
 
-        # Lineup check — verify replaced player was a starter
         lineup_verified = verify_in_lineup(replaced, team) if replaced else None
-
-        # Confidence score
-        confidence = calculate_confidence(active, lineup_verified)
-
-        lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
+        confidence      = calculate_confidence(active, lineup_verified)
+        lines_data      = get_player_lines(pinch_hitter) if pinch_hitter else {}
         post_alert(team, active, lines_data, confidence, lineup_verified)
 
 def add_signals(new_signals):
@@ -595,7 +562,6 @@ def run():
         now_et = datetime.now(ET_TZ)
         hour   = now_et.hour
 
-        # Game hours check: 12pm to 1am ET
         if not (hour >= 12 or hour == 0):
             print(f"[{now_et.strftime('%H:%M ET')}] Outside game hours — sleeping 10 min")
             time.sleep(600)
@@ -604,7 +570,6 @@ def run():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle}")
         all_new = []
 
-        # General keyword searches
         for kw in ["pinch hit", "pinch-hit"]:
             query = f'"{kw}" baseball -is:retweet lang:en'
             data  = search_tweets(query, max_results=15)
@@ -614,7 +579,6 @@ def run():
             all_new.extend(process_tweets(tweets, users))
             time.sleep(2)
 
-        # Rotate through reporter timelines
         batch_start     = (cycle * 6) % len(REPORTERS)
         batch_reporters = REPORTERS[batch_start:batch_start + 6]
         for reporter in batch_reporters:
