@@ -506,6 +506,13 @@ def check_and_alert():
         recent_signals[team] = [s for s in recent_signals[team]
                                  if now - s["timestamp"] <= ALERT_WINDOW]
         active = recent_signals[team]
+
+        # ── RULE: must have at least 1 verified beat reporter ─────────────────
+        reporter_count = sum(1 for s in active if s["is_reporter"])
+        if reporter_count < 1:
+            continue
+
+        # ── RULE: must have at least 3 total sources ──────────────────────────
         if len(active) < MIN_SOURCES:
             continue
 
