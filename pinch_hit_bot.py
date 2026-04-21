@@ -537,6 +537,7 @@ def format_lines(lines_data):
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def post_discord(payload):
     if not DISCORD_WEBHOOK_URL:
+        print("[discord error] Webhook URL is missing!")
         return
     try:
         requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
@@ -687,21 +688,20 @@ def check_and_alert():
         pinch_hitter     = find_most_common(active, "pinch_hitter")
         replaced         = find_most_common(active, "replaced")
 
-        # TIER 1 — 2+ general sources
-        if len(general_signals) >= TIER1_MIN_GENERAL and tier1_key not in tier1_posted:
+        # ── TIER 2 FIRST: reporter can bypass Tier 1 requirement ─────────────
+        if len(reporter_signals) >= TIER2_MIN_REPORTERS and tier2_key not in tier2_posted:
+            tier2_posted.add(tier2_key)
+            tier1_posted.add(tier1_key)  # prevent redundant Tier 1 after Tier 2
+            lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
+            post_tier2(team, reporter_signals, active, lines_data)
+
+        # ── TIER 1: 2+ general Twitter sources (only if Tier 2 hasn't fired) ─
+        elif len(general_signals) >= TIER1_MIN_GENERAL and tier1_key not in tier1_posted:
             tier1_posted.add(tier1_key)
             lineup_verified = verify_in_lineup(replaced)
             confidence      = calculate_confidence(active, lineup_verified)
             lines_data      = get_player_lines(pinch_hitter) if pinch_hitter else {}
             post_tier1(team, active, lines_data, confidence, lineup_verified)
-
-        # TIER 2 — beat reporter confirms (only after tier 1)
-        if (len(reporter_signals) >= TIER2_MIN_REPORTERS
-                and tier1_key in tier1_posted
-                and tier2_key not in tier2_posted):
-            tier2_posted.add(tier2_key)
-            lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
-            post_tier2(team, reporter_signals, active, lines_data)
 
 def add_signals(new_signals):
     for s in new_signals:
@@ -719,6 +719,10 @@ def run():
 
     if not TWITTER_BEARER_TOKEN:
         print("[error] TWITTER_BEARER_TOKEN not set!")
+        return
+
+    if not DISCORD_WEBHOOK_URL:
+        print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
 
     build_player_team_map()
