@@ -1,16 +1,16 @@
 """
-MLB Pinch Hit Alert Bot - Final Version
+MLB Pinch Hit Alert Bot - Revised Version
 Two tier system:
   TIER 1: 2+ general Twitter sources with strict pre-event pinch hit language
+          OR 1+ beat reporter signal (reporter alone triggers Tier 1)
   TIER 2: 1+ verified beat reporter confirms → mega confirmation message
 
-Key design decisions:
-  - Strict regex patterns only — no vague keywords like "on deck" or "coming out"
-  - Reject phrases tuned to not block legitimate tweets
-  - Roster lookup maps player names to teams automatically
-  - Game hours 12pm-1am ET only
-  - Daily reset at midnight
-  - @everyone on every alert
+Key changes from previous version:
+  - Team detection no longer drops signals — falls back to "Unknown" instead of skipping
+  - Loosened REJECT_PHRASES — removed overly broad words that were blocking real tweets
+  - Reporter alone now fires Tier 1 (no need to wait for general sources)
+  - ALERT_WINDOW kept at 180s to keep alerts fast enough for live betting
+  - TIER1_MIN_GENERAL stays at 2 for general-only signals (realistic for in-game pinch hits)
 """
 
 import os
@@ -127,33 +127,29 @@ TEAM_ALIASES = {
 }
 
 # ── PRE-EVENT PATTERNS ────────────────────────────────────────────────────────
-# These are tight and specific — only match genuine pre-event pinch hit language
 PRE_EVENT_PATTERNS = [
-    r'\bwill\s+pinch[- ]hit\b',            # "X will pinch hit"
-    r'\bpinch[- ]hitting\s+for\b',         # "pinch hitting for X"
-    r'\bpinch[- ]hit\s+for\b',             # "pinch hit for X"
-    r'\bis\s+pinch[- ]hitting\b',          # "X is pinch hitting"
-    r'\bph\s+for\b',                       # "ph for X" — baseball shorthand
-    r'\bpinch\s+hitter\s+(?:is\s+)?up\b',  # "pinch hitter up"
-    r'\bsent\s+up\s+to\s+bat\b',           # "sent up to bat"
-    r'\bsent\s+to\s+the\s+plate\b',        # "sent to the plate"
-    r'\bup\s+to\s+bat\s+for\b',            # "up to bat for X"
-    r'\bgoing\s+to\s+pinch[- ]hit\b',      # "going to pinch hit"
-    r'\bwill\s+bat\s+for\b',               # "will bat for X"
-    r'\bpinch[- ]hitting\b',               # "X is pinch-hitting"
+    r'\bwill\s+pinch[- ]hit\b',
+    r'\bpinch[- ]hitting\s+for\b',
+    r'\bpinch[- ]hit\s+for\b',
+    r'\bis\s+pinch[- ]hitting\b',
+    r'\bph\s+for\b',
+    r'\bpinch\s+hitter\s+(?:is\s+)?up\b',
+    r'\bsent\s+up\s+to\s+bat\b',
+    r'\bsent\s+to\s+the\s+plate\b',
+    r'\bup\s+to\s+bat\s+for\b',
+    r'\bgoing\s+to\s+pinch[- ]hit\b',
+    r'\bwill\s+bat\s+for\b',
+    r'\bpinch[- ]hitting\b',
 ]
 
 # ── REJECT PHRASES ────────────────────────────────────────────────────────────
-# These indicate the event ALREADY happened — reject these tweets
+# Trimmed to only clear post-event language — removed overly broad words
+# that were likely blocking legitimate pre-event tweets
 REJECT_PHRASES = [
     "home run", "homered", "hit a", "singled", "doubled", "tripled",
-    "drove in", "rbi", "scores", "scored", "flies out", "grounds out",
-    "struck out", "strikeout", "career", "first career",
-    "solo shot", "connects", "connected", "reaches", "reached",
-    "pops out", "lines out",
+    "drove in", "struck out", "strikeout",
     "pinch-hit home run", "pinch hit home run",
     "pinch-hit single", "pinch hit single",
-    "pinch-hit rbi", "pinch hit rbi",
     "just hit", "just pinch hit", "already pinch",
     "last night", "yesterday",
 ]
@@ -414,7 +410,6 @@ def is_pre_event(text):
 
 def extract_players(text):
     """Extract (pinch_hitter, replaced_player) from tweet text."""
-    # Both players mentioned
     patterns_both = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?batting\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -426,7 +421,6 @@ def extract_players(text):
         if m:
             return m.group(1), m.group(2)
 
-    # Only pinch hitter mentioned
     patterns_hitter = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch[- ]hit',
         r'(?:ph|pinch[- ]hit(?:ting)?)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -438,7 +432,6 @@ def extract_players(text):
         if m:
             return m.group(1), None
 
-    # Only replaced player mentioned
     patterns_out = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:being\s+)?lifted',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?coming\s+out',
@@ -545,9 +538,10 @@ def post_discord(payload):
         print(f"[discord error] {e}")
 
 def post_tier1(team, signals, lines_data, confidence, lineup_verified):
-    summary = build_summary(signals)
-    conf_em = confidence_emoji(confidence)
-    gc      = sum(1 for s in signals if not s["is_reporter"])
+    summary  = build_summary(signals)
+    conf_em  = confidence_emoji(confidence)
+    gc       = sum(1 for s in signals if not s["is_reporter"])
+    rep_count = sum(1 for s in signals if s["is_reporter"])
 
     if lineup_verified is True:
         lineup_note = "✅ Starter confirmed in lineup"
@@ -555,6 +549,14 @@ def post_tier1(team, signals, lines_data, confidence, lineup_verified):
         lineup_note = "⚠️ Not in starting lineup — possible injury sub"
     else:
         lineup_note = "❓ Lineup check unavailable"
+
+    # Source count line — distinguish reporter-only vs general
+    if rep_count >= 1 and gc == 0:
+        source_line = f"**{rep_count} beat reporter** reporting pre-event pinch hit"
+    elif rep_count >= 1:
+        source_line = f"**{gc} Twitter source(s) + {rep_count} reporter** reporting pre-event pinch hit"
+    else:
+        source_line = f"**{gc} Twitter sources** reporting pre-event pinch hit"
 
     seen_handles, src_lines = set(), []
     for s in signals:
@@ -568,9 +570,11 @@ def post_tier1(team, signals, lines_data, confidence, lineup_verified):
         if len(src_lines) >= 3:
             break
 
-    embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
+    team_display = team if team != "Unknown" else "Unknown Team"
+
+    embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team_display}",
         "description": (
-            f"**{gc} Twitter sources** reporting pre-event pinch hit\n"
+            f"{source_line}\n"
             f"{conf_em} **Confidence: {confidence}/10** | {lineup_note}\n\n"
             f"📋 **{summary}**\n\n"
             + "\n\n".join(src_lines) +
@@ -582,7 +586,7 @@ def post_tier1(team, signals, lines_data, confidence, lineup_verified):
         "footer": {"text": f"Tier 1 · Pinch Hit Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
 
     post_discord({"content": "@everyone", "embeds": embed["embeds"]})
-    print(f"  🟡 Tier 1: {team} — {summary} (conf={confidence})")
+    print(f"  🟡 Tier 1: {team_display} — {summary} (conf={confidence})")
 
 def post_tier2(team, reporter_signals, all_signals, lines_data):
     summary   = build_summary(all_signals)
@@ -598,7 +602,9 @@ def post_tier2(team, reporter_signals, all_signals, lines_data):
         if len(rep_lines) >= 2:
             break
 
-    embed = {"embeds": [{"title": f"🔥💥 BEAT REPORTER CONFIRMED — {team}",
+    team_display = team if team != "Unknown" else "Unknown Team"
+
+    embed = {"embeds": [{"title": f"🔥💥 BEAT REPORTER CONFIRMED — {team_display}",
         "description": (
             f"**MEGA CONFIRMATION — Verified beat reporter confirmed the pinch hit**\n\n"
             f"📋 **{summary}**\n\n"
@@ -610,11 +616,11 @@ def post_tier2(team, reporter_signals, all_signals, lines_data):
         "footer": {"text": f"Tier 2 · Pinch Hit Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
 
     post_discord({"content": "@everyone 🔥 REPORTER CONFIRMED", "embeds": embed["embeds"]})
-    print(f"  🟢 Tier 2: {team} — {summary}")
+    print(f"  🟢 Tier 2: {team_display} — {summary}")
 
 # ── PROCESS TWEETS ────────────────────────────────────────────────────────────
 def process_tweets(tweets, users):
-    now        = datetime.now(timezone.utc).timestamp()
+    now         = datetime.now(timezone.utc).timestamp()
     new_signals = []
 
     for tweet in tweets:
@@ -638,7 +644,7 @@ def process_tweets(tweets, users):
         pinch_hitter, replaced = extract_players(text)
         url                    = f"https://twitter.com/{handle}/status/{tid}"
 
-        # Team inference
+        # Team inference — try multiple methods
         if not team:
             if pinch_hitter:
                 team = lookup_player_team(pinch_hitter)
@@ -647,9 +653,12 @@ def process_tweets(tweets, users):
             if not team:
                 team = infer_team_from_text(text)
 
+        # ── KEY CHANGE: no longer drop signals with unknown team ──────────────
+        # Previously this was a hard `continue` — signals were silently lost.
+        # Now we assign "Unknown" and let the alert fire anyway.
         if not team:
-            print(f"  ❓ No team: @{handle}: {text[:60]}")
-            continue
+            team = "Unknown"
+            print(f"  ⚠️  No team found: @{handle}: {text[:60]} — using 'Unknown'")
 
         new_signals.append({
             "handle":       handle,
@@ -688,15 +697,23 @@ def check_and_alert():
         pinch_hitter     = find_most_common(active, "pinch_hitter")
         replaced         = find_most_common(active, "replaced")
 
-        # ── TIER 2 FIRST: reporter can bypass Tier 1 requirement ─────────────
+        # ── TIER 2: reporter confirms → mega alert ────────────────────────────
         if len(reporter_signals) >= TIER2_MIN_REPORTERS and tier2_key not in tier2_posted:
             tier2_posted.add(tier2_key)
-            tier1_posted.add(tier1_key)  # prevent redundant Tier 1 after Tier 2
+            tier1_posted.add(tier1_key)  # suppress redundant Tier 1 after Tier 2
             lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
             post_tier2(team, reporter_signals, active, lines_data)
 
-        # ── TIER 1: 2+ general Twitter sources (only if Tier 2 hasn't fired) ─
+        # ── TIER 1A: 2+ general Twitter sources ───────────────────────────────
         elif len(general_signals) >= TIER1_MIN_GENERAL and tier1_key not in tier1_posted:
+            tier1_posted.add(tier1_key)
+            lineup_verified = verify_in_lineup(replaced)
+            confidence      = calculate_confidence(active, lineup_verified)
+            lines_data      = get_player_lines(pinch_hitter) if pinch_hitter else {}
+            post_tier1(team, active, lines_data, confidence, lineup_verified)
+
+        # ── TIER 1B: single reporter signal (no general sources needed) ───────
+        elif len(reporter_signals) >= 1 and tier1_key not in tier1_posted:
             tier1_posted.add(tier1_key)
             lineup_verified = verify_in_lineup(replaced)
             confidence      = calculate_confidence(active, lineup_verified)
@@ -712,9 +729,10 @@ def add_signals(new_signals):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot — Final Version")
-    print(f"   Tier 1: {TIER1_MIN_GENERAL}+ general Twitter sources")
-    print(f"   Tier 2: {TIER2_MIN_REPORTERS}+ beat reporter confirmation")
+    print("⚾ MLB Pinch Hit Bot — Revised Version")
+    print(f"   Tier 1A: {TIER1_MIN_GENERAL}+ general Twitter sources")
+    print(f"   Tier 1B: 1+ beat reporter (solo — no general sources needed)")
+    print(f"   Tier 2:  {TIER2_MIN_REPORTERS}+ beat reporter confirmation → mega alert")
     print(f"   {len(REPORTERS)} reporters | window={ALERT_WINDOW}s | poll={POLL_INTERVAL}s\n")
 
     if not TWITTER_BEARER_TOKEN:
