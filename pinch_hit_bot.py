@@ -21,7 +21,7 @@ import pytz
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
-POLL_INTERVAL        = 30
+POLL_INTERVAL        = 10
 ET_TZ                = pytz.timezone("America/New_York")
 MAX_TWEET_AGE_SECS   = 600
 PLAYER_COOLDOWN_SEC  = 7200   # 2 hours per player
