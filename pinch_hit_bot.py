@@ -1,10 +1,13 @@
 """
-MLB Pinch Hit Alert Bot - Clean Rebuild v2
-Fixes:
-  1) MLB roster cross-check — at least one player must be on an active MLB roster
-  2) All reporters checked every cycle instead of rotating 6 per cycle
-  3) @ mentions stripped before player name extraction
+MLB Pinch Hit Alert Bot - Clean Rebuild v3
+Fixes from v2:
+  1) MLB roster cross-check
+  2) All reporters checked every cycle
+  3) @mentions stripped before player extraction
   4) Tweet age check — reject tweets older than 10 minutes
+New in v3:
+  5) Opinion/complaint/hypothetical language rejected
+  6) Player cooldown — max 2 alerts per player per 2 hours
 """
 
 import os
@@ -20,7 +23,9 @@ DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
 POLL_INTERVAL        = 30
 ET_TZ                = pytz.timezone("America/New_York")
-MAX_TWEET_AGE_SECS   = 600   # reject tweets older than 10 minutes
+MAX_TWEET_AGE_SECS   = 600
+PLAYER_COOLDOWN_SEC  = 7200   # 2 hours per player
+PLAYER_MAX_ALERTS    = 2      # max alerts before cooldown kicks in
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -84,7 +89,6 @@ REPORTERS = [
 REPORTER_HANDLES   = {r["handle"].lower() for r in REPORTERS}
 REPORTER_BY_HANDLE = {r["handle"].lower(): r for r in REPORTERS}
 
-# ── TEAM ALIASES ──────────────────────────────────────────────────────────────
 TEAM_ALIASES = {
     "orioles": "Orioles", "baltimore": "Orioles",
     "red sox": "Red Sox", "boston": "Red Sox",
@@ -118,18 +122,18 @@ TEAM_ALIASES = {
     "giants": "Giants", "san francisco": "Giants",
 }
 
-# ── PRESENT/FUTURE MARKERS ────────────────────────────────────────────────────
 PRESENT_FUTURE_MARKERS = [
     r'\bis\b', r'\bwill\b', r'\bslated\b', r'\bon\s+deck\b',
     r'\bexpected\b', r'\bgoing\s+to\b', r'\bset\s+to\b',
     r'\bcoming\s+up\b', r'\bheading\b', r'\bwarming\b',
     r'\bscheduled\b', r'\bdue\s+to\b', r'\bappears\b',
-    r'\blooks\s+like\b', r'\bshould\b', r'\bunclear\b',
+    r'\blooks\s+like\b', r'\bunclear\b',
     r'\btaking\s+over\b', r'\bcoming\s+in\b',
 ]
 
 # ── REJECT PHRASES ────────────────────────────────────────────────────────────
 REJECT_PHRASES = [
+    # Past tense / results
     "home run", "homered", "hit a", "singled", "doubled", "tripled",
     "drove in", "struck out", "flies out", "grounds out",
     "pinch-hit home run", "pinch hit home run",
@@ -140,9 +144,21 @@ REJECT_PHRASES = [
     "in the 4th", "in the 5th", "in the 6th",
     "in the 7th", "in the 8th", "in the 9th",
     "went 1-for", "went 0-for", "went 2-for",
+    # Opinion / complaint / hypothetical — NEW in v3
+    "why pinch hit", "why would", "should have", "shouldn't have",
+    "should not have", "bad decision", "bad manager", "terrible decision",
+    "doesn't make sense", "makes no sense", "i hate when", "i don't understand",
+    "can't believe", "cannot believe", "questionable",
+    "what a waste", "poor decision", "wrong decision",
+    "never should", "he keeps", "keeps making", "mistake",
+    "would you pinch", "if i were", "hypothetically",
+    "in theory", "imagine if", "what if",
+    "how often", "it's funny", "its funny", "funny how",
+    "rewards players", "punish", "not to blame",
+    "i would have", "i would not", "i wouldn't",
+    "unless he", "unless they", "unless the",
 ]
 
-# ── ODDS API ──────────────────────────────────────────────────────────────────
 PROP_BOOKS = {
     "draftkings":  "DraftKings",
     "fanduel":     "FanDuel",
@@ -168,8 +184,29 @@ posted_alert_keys   = set()
 last_reset_date     = None
 player_team_map     = {}
 last_roster_refresh = 0
+player_alert_count  = {}   # {last_name: count}
+player_alert_time   = {}   # {last_name: timestamp}
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+
+# ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
+def is_player_on_cooldown(player_name):
+    if not player_name:
+        return False
+    key = player_name.lower().split()[-1]
+    now = time.time()
+    if key in player_alert_time:
+        if now - player_alert_time[key] > PLAYER_COOLDOWN_SEC:
+            player_alert_count[key] = 0
+    return player_alert_count.get(key, 0) >= PLAYER_MAX_ALERTS
+
+def record_player_alert(player_name):
+    if not player_name:
+        return
+    key = player_name.lower().split()[-1]
+    player_alert_count[key] = player_alert_count.get(key, 0) + 1
+    player_alert_time[key]  = time.time()
+    print(f"  📊 Player alert count: {key} = {player_alert_count[key]}")
 
 # ── ROSTER LOOKUP ─────────────────────────────────────────────────────────────
 def build_player_team_map():
@@ -205,7 +242,6 @@ def build_player_team_map():
     print(f"[roster] {len(new_map)} entries loaded\n")
 
 def lookup_player_team(name):
-    """Return team name if player is on an active MLB roster, else None."""
     if not name or not player_team_map:
         return None
     nl = name.lower().strip()
@@ -214,7 +250,6 @@ def lookup_player_team(name):
     return player_team_map.get(nl.split()[-1])
 
 def is_mlb_player(name):
-    """Returns True if name matches any active MLB roster entry."""
     return lookup_player_team(name) is not None
 
 def infer_team_from_text(text):
@@ -239,25 +274,25 @@ def is_game_hours():
 
 def maybe_reset_daily():
     global seen_tweet_ids, last_reset_date, posted_alert_keys
+    global player_alert_count, player_alert_time
     today = datetime.now(ET_TZ).date()
     if last_reset_date is None:
         last_reset_date = today
         return
     if today > last_reset_date:
         print("[reset] New day — clearing state")
-        seen_tweet_ids    = set()
-        posted_alert_keys = set()
-        last_reset_date   = today
+        seen_tweet_ids      = set()
+        posted_alert_keys   = set()
+        player_alert_count  = {}
+        player_alert_time   = {}
+        last_reset_date     = today
 
 # ── TWEET AGE CHECK ───────────────────────────────────────────────────────────
 def is_recent(created_at_str):
-    """Returns True if tweet was posted within MAX_TWEET_AGE_SECS."""
     if not created_at_str:
-        return True  # if no timestamp, allow it
+        return True
     try:
-        tweet_time = datetime.fromisoformat(
-            created_at_str.replace("Z", "+00:00")
-        )
+        tweet_time = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
         age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
         return age <= MAX_TWEET_AGE_SECS
     except:
@@ -265,7 +300,6 @@ def is_recent(created_at_str):
 
 # ── DETECTION ─────────────────────────────────────────────────────────────────
 def strip_mentions(text):
-    """Remove @mentions from text before extracting player names."""
     return re.sub(r'@\w+', '', text)
 
 def is_present_future(text):
@@ -279,12 +313,7 @@ def is_present_future(text):
     return False, "no present/future marker"
 
 def extract_players(text):
-    """
-    Extract (pinch_hitter, replaced_player).
-    Strips @mentions first to avoid treating Twitter handles as player names.
-    """
     clean = strip_mentions(text)
-
     patterns_both = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -398,7 +427,7 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_d
             f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
         ),
         "color": 0x00FF00,
-        "footer": {"text": f"Beat Reporter · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
+        "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
     post_discord({"content": "@everyone 🔥 BEAT REPORTER", "embeds": embed["embeds"]})
     print(f"  🟢 Reporter alert: {team} — {summary}")
 
@@ -421,7 +450,7 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_da
             f"💰 **BET THE UNDER ON ALL LINES NOW**"
         ),
         "color": 0xF1C40F,
-        "footer": {"text": f"General Alert · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
+        "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
     post_discord({"content": "@everyone", "embeds": embed["embeds"]})
     print(f"  🟡 General alert: {team} — {summary}")
 
@@ -461,8 +490,7 @@ def get_user_tweets(user_id, max_results=5):
         r = requests.get(
             f"https://api.twitter.com/2/users/{user_id}/tweets",
             headers=TWITTER_HEADERS,
-            params={"max_results": max_results,
-                    "tweet.fields": "created_at,text"},
+            params={"max_results": max_results, "tweet.fields": "created_at,text"},
             timeout=10
         )
         r.raise_for_status()
@@ -479,8 +507,7 @@ def get_user_ids_batch(handles):
             timeout=10
         )
         r.raise_for_status()
-        return {u["username"].lower(): u["id"]
-                for u in r.json().get("data", [])}
+        return {u["username"].lower(): u["id"] for u in r.json().get("data", [])}
     except Exception as e:
         print(f"[user id error] {e}")
         return {}
@@ -494,7 +521,7 @@ def process_and_alert(tweets, users):
         handle     = users.get(aid, "unknown")
         created_at = tweet.get("created_at", "")
 
-        # ── FIX 4: reject old tweets ──────────────────────────────────────────
+        # Reject old tweets
         if not is_recent(created_at):
             continue
 
@@ -503,7 +530,7 @@ def process_and_alert(tweets, users):
             continue
         seen_tweet_ids.add(tid)
 
-        # Core phrase check — must contain one of our target phrases
+        # Core phrase check
         tl = text.lower()
         core_phrases = [
             "on deck to pinch hit",
@@ -515,28 +542,33 @@ def process_and_alert(tweets, users):
         if not any(phrase in tl for phrase in core_phrases):
             continue
 
-        # Present/future tense check
+        # Present/future + opinion filter
         is_live, reason = is_present_future(text)
         if not is_live:
             print(f"  🚫 @{handle}: {reason} — {text[:60]}")
             continue
 
-        # ── FIX 3: strip @mentions before extracting player names ─────────────
+        # Extract players (with @mention stripping)
         pinch_hitter, replaced = extract_players(text)
 
-        # ── FIX 1: MLB roster cross-check ─────────────────────────────────────
-        # At least one player must be on an active MLB roster
+        # MLB roster cross-check
         ph_is_mlb  = is_mlb_player(pinch_hitter) if pinch_hitter else False
         rep_is_mlb = is_mlb_player(replaced) if replaced else False
 
         if pinch_hitter and replaced and not ph_is_mlb and not rep_is_mlb:
-            print(f"  🚫 @{handle}: neither '{pinch_hitter}' nor '{replaced}' on MLB roster — skipping")
+            print(f"  🚫 Neither '{pinch_hitter}' nor '{replaced}' on MLB roster")
             continue
         elif pinch_hitter and not replaced and not ph_is_mlb:
-            print(f"  🚫 @{handle}: '{pinch_hitter}' not on MLB roster — skipping")
+            print(f"  🚫 '{pinch_hitter}' not on MLB roster")
             continue
         elif replaced and not pinch_hitter and not rep_is_mlb:
-            print(f"  🚫 @{handle}: '{replaced}' not on MLB roster — skipping")
+            print(f"  🚫 '{replaced}' not on MLB roster")
+            continue
+
+        # ── FIX 5: player cooldown check ─────────────────────────────────────
+        key_player = pinch_hitter or replaced
+        if is_player_on_cooldown(key_player):
+            print(f"  🔇 @{handle}: '{key_player}' on cooldown — too many alerts already")
             continue
 
         # Determine team
@@ -565,6 +597,9 @@ def process_and_alert(tweets, users):
               f"team={team} ph={pinch_hitter} out={replaced}")
         print(f"     Tweet: {text[:100]}")
 
+        # Record alert for cooldown tracking
+        record_player_alert(key_player)
+
         lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
 
         if is_reporter:
@@ -574,11 +609,9 @@ def process_and_alert(tweets, users):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v2")
-    print("   Fix 1: MLB roster cross-check — filters non-MLB players")
-    print("   Fix 2: All reporters checked every cycle")
-    print("   Fix 3: @mentions stripped before player extraction")
-    print("   Fix 4: Tweets older than 10 min rejected")
+    print("⚾ MLB Pinch Hit Bot v3")
+    print("   Fix 5: Opinion/complaint/hypothetical language rejected")
+    print("   Fix 6: Player cooldown — max 2 alerts per player per 2 hours")
     print(f"   {len(REPORTERS)} reporters | poll={POLL_INTERVAL}s\n")
 
     if not TWITTER_BEARER_TOKEN:
@@ -590,7 +623,6 @@ def run():
 
     build_player_team_map()
 
-    # ── FIX 2: look up ALL reporter IDs upfront ───────────────────────────────
     print("Looking up reporter user IDs...")
     handles  = [r["handle"] for r in REPORTERS]
     user_ids = {}
@@ -612,37 +644,31 @@ def run():
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle}")
 
-        # ── Search 1: "on deck to pinch hit" — your best signal ─────────────
         users1, tweets1 = search_tweets('"on deck to pinch hit" -is:retweet lang:en', 15)
         print(f"   'on deck to pinch hit': {len(tweets1)} tweets")
         process_and_alert(tweets1, users1)
         time.sleep(2)
 
-        # ── Search 2: "slated to pinch hit" ──────────────────────────────────
         users2, tweets2 = search_tweets('"slated to pinch hit" -is:retweet lang:en', 15)
         print(f"   'slated to pinch hit': {len(tweets2)} tweets")
         process_and_alert(tweets2, users2)
         time.sleep(2)
 
-        # ── Search 3: "pinch hit for" — broad catch ───────────────────────────
         users3, tweets3 = search_tweets('"pinch hit for" -is:retweet lang:en', 15)
         print(f"   'pinch hit for': {len(tweets3)} tweets")
         process_and_alert(tweets3, users3)
         time.sleep(2)
 
-        # ── Search 4: "pinch-hit for" — hyphenated ────────────────────────────
         users4, tweets4 = search_tweets('"pinch-hit for" -is:retweet lang:en', 15)
         print(f"   'pinch-hit for': {len(tweets4)} tweets")
         process_and_alert(tweets4, users4)
         time.sleep(2)
 
-        # ── Search 5: "will pinch hit" — future tense ─────────────────────────
         users5, tweets5 = search_tweets('"will pinch hit" -is:retweet lang:en', 15)
         print(f"   'will pinch hit': {len(tweets5)} tweets")
         process_and_alert(tweets5, users5)
         time.sleep(2)
 
-        # ── FIX 2: check ALL reporters every cycle ────────────────────────────
         rep_checked = 0
         for reporter in REPORTERS:
             handle = reporter["handle"].lower()
