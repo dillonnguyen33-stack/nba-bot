@@ -1,9 +1,5 @@
 # Documentation
 .a/
-
-# Planning
-.planning/
-
 # Python
 __pycache__/
 *.pyc

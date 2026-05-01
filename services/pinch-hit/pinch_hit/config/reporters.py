@@ -1,5 +1,14 @@
-# Read-only — Phase 2 consumer populates user_id at startup via batch API lookup
-REPORTERS = [
+from typing import TypedDict
+
+
+class Reporter(TypedDict):
+    handle: str
+    user_id: str | None
+    team: str
+
+
+# user_id is None at import time; twitter_consumer resolves IDs via batch lookup at startup
+REPORTERS: list[Reporter] = [
     {"handle": "JakeDRill",       "user_id": None, "team": "Orioles"},
     {"handle": "masnRoch",        "user_id": None, "team": "Orioles"},
     {"handle": "IanMBrowne",      "user_id": None, "team": "Red Sox"},

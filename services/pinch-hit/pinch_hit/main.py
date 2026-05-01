@@ -1,13 +1,11 @@
 import asyncio
 
-from pinch_hit.state.db import init_db, close_db
+from pinch_hit.state.db import init_db
 
 
 async def main() -> None:
     await init_db()
-    # Consumer and worker tasks wired here: asyncio.gather(twitter_consumer(), ...)
-    print("[main] Foundation initialized — no tasks running yet")
-    await asyncio.sleep(0)
+    # Wire consumer/worker tasks here when twitter_consumer is implemented
 
 
 if __name__ == "__main__":
