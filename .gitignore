@@ -1,0 +1,19 @@
+# Documentation
+.a/
+
+# Planning
+.planning/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Database
+*.db
+
+# Environment
+.env
+
+# macOS
+.DS_Store
