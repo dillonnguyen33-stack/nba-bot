@@ -20,7 +20,7 @@ class PendingAlertRow(TypedDict):
     tweet_id: str
     posted_at: str
     confirmed_at: str | None
-    status: str
+    status: AlertStatus
 
 
 async def insert_pending_alert(
@@ -42,7 +42,8 @@ async def insert_pending_alert(
          replaced_player, team_id, game_pk, tweet_id),
     )
     await db.commit()
-    assert cursor.lastrowid is not None
+    if cursor.lastrowid is None:
+        raise RuntimeError("insert_pending_alert: no row ID returned")
     return cursor.lastrowid
 
 
@@ -103,3 +104,4 @@ async def nightly_cleanup() -> None:
         await db.commit()
     except Exception as e:
         print(f"[cleanup error] {e}")
+        raise
