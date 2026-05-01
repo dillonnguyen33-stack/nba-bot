@@ -1,7 +1,27 @@
+from typing import Literal, TypedDict
+
 from pinch_hit.state.db import get_db
 
+AlertStatus = Literal["pending", "confirmed", "timeout"]
 
-# ── pending_alerts ─────────────────────────────────────────────────────────────
+STATUS_PENDING: AlertStatus = "pending"
+STATUS_CONFIRMED: AlertStatus = "confirmed"
+STATUS_TIMEOUT: AlertStatus = "timeout"
+
+
+class PendingAlertRow(TypedDict):
+    id: int
+    discord_message_id: str
+    pinch_hitter_raw: str
+    pinch_hitter_normalized: str
+    replaced_player: str | None
+    team_id: int
+    game_pk: int | None
+    tweet_id: str
+    posted_at: str
+    confirmed_at: str | None
+    status: str
+
 
 async def insert_pending_alert(
     discord_message_id: str,
@@ -22,10 +42,11 @@ async def insert_pending_alert(
          replaced_player, team_id, game_pk, tweet_id),
     )
     await db.commit()
+    assert cursor.lastrowid is not None
     return cursor.lastrowid
 
 
-async def get_pending_alerts_by_team(team_id: int) -> list[dict]:
+async def get_pending_alerts_by_team(team_id: int) -> list[PendingAlertRow]:
     db = await get_db()
     async with db.execute(
         "SELECT * FROM pending_alerts WHERE status = 'pending' AND team_id = ?",
@@ -35,16 +56,20 @@ async def get_pending_alerts_by_team(team_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def update_alert_status(alert_id: int, status: str) -> None:
+async def update_alert_status(alert_id: int, status: AlertStatus) -> None:
     db = await get_db()
-    await db.execute(
-        "UPDATE pending_alerts SET status = ?, confirmed_at = datetime('now') WHERE id = ?",
-        (status, alert_id),
-    )
+    if status == STATUS_CONFIRMED:
+        await db.execute(
+            "UPDATE pending_alerts SET status = ?, confirmed_at = datetime('now') WHERE id = ?",
+            (status, alert_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE pending_alerts SET status = ? WHERE id = ?",
+            (status, alert_id),
+        )
     await db.commit()
 
-
-# ── seen_tweets ────────────────────────────────────────────────────────────────
 
 async def insert_seen_tweet(tweet_id: str) -> None:
     db = await get_db()
@@ -63,21 +88,18 @@ async def is_tweet_seen(tweet_id: str) -> bool:
         return await cursor.fetchone() is not None
 
 
-# ── evaluation_log ─────────────────────────────────────────────────────────────
-
-async def insert_eval_row(
-    event_type: str,
-    source: str,
-    game_pk: int | None = None,
-    pinch_hitter: str | None = None,
-    team_id: int | None = None,
-    raw_payload: str | None = None,
-) -> None:
-    db = await get_db()
-    await db.execute(
-        """INSERT INTO evaluation_log
-           (event_type, source, game_pk, pinch_hitter, team_id, raw_payload)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (event_type, source, game_pk, pinch_hitter, team_id, raw_payload),
-    )
-    await db.commit()
+async def nightly_cleanup() -> None:
+    """Prevent unbounded DB growth on the Railway persistent volume."""
+    try:
+        db = await get_db()
+        await db.execute(
+            "DELETE FROM seen_tweets WHERE seen_at < datetime('now', '-1 day')"
+        )
+        await db.execute(
+            """DELETE FROM pending_alerts
+               WHERE status IN ('confirmed', 'timeout')
+               AND posted_at < datetime('now', '-7 days')"""
+        )
+        await db.commit()
+    except Exception as e:
+        print(f"[cleanup error] {e}")
