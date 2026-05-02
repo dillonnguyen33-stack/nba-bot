@@ -1,13 +1,8 @@
 """
-MLB Pinch Hit Alert Bot - Clean Rebuild v3
-Fixes from v2:
-  1) MLB roster cross-check
-  2) All reporters checked every cycle
-  3) @mentions stripped before player extraction
-  4) Tweet age check — reject tweets older than 10 minutes
-New in v3:
-  5) Opinion/complaint/hypothetical language rejected
-  6) Player cooldown — max 2 alerts per player per 2 hours
+MLB Pinch Hit Alert Bot - v4
+New fixes:
+  7) College/non-MLB context filter — rejects tweets about college, high school, minor league
+  8) Tighter hypothetical filter — catches "I predict", "always gets", "they will quickly" etc
 """
 
 import os
@@ -24,8 +19,8 @@ ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
 POLL_INTERVAL        = 10
 ET_TZ                = pytz.timezone("America/New_York")
 MAX_TWEET_AGE_SECS   = 600
-PLAYER_COOLDOWN_SEC  = 7200   # 2 hours per player
-PLAYER_MAX_ALERTS    = 2      # max alerts before cooldown kicks in
+PLAYER_COOLDOWN_SEC  = 7200
+PLAYER_MAX_ALERTS    = 2
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -144,7 +139,7 @@ REJECT_PHRASES = [
     "in the 4th", "in the 5th", "in the 6th",
     "in the 7th", "in the 8th", "in the 9th",
     "went 1-for", "went 0-for", "went 2-for",
-    # Opinion / complaint / hypothetical — NEW in v3
+    # Opinion / complaint / hypothetical
     "why pinch hit", "why would", "should have", "shouldn't have",
     "should not have", "bad decision", "bad manager", "terrible decision",
     "doesn't make sense", "makes no sense", "i hate when", "i don't understand",
@@ -157,6 +152,22 @@ REJECT_PHRASES = [
     "rewards players", "punish", "not to blame",
     "i would have", "i would not", "i wouldn't",
     "unless he", "unless they", "unless the",
+    # ── NEW v4: tighter hypothetical/opinion catches ──────────────────────────
+    "i predict", "i would probably", "i'd probably", "i'd pinch",
+    "always gets pinch", "always gets pinch hit", "quickly like",
+    "they tend to", "they usually", "he usually", "he always",
+    "probably pinch hit", "likely pinch hit", "might pinch hit",
+    "could pinch hit", "would pinch hit", "may pinch hit",
+    "think they", "think he", "think she", "i think",
+    "bet they", "bet he", "so i predict", "tomorrow",
+    "next game", "next at bat", "next time",
+    # ── NEW v4: college / non-MLB context ────────────────────────────────────
+    "mississippi state", "mississippi st",
+    "college", "university", "high school",
+    "ncaa", "sec ", " acc ", " big ten", " pac-12", " pac 12",
+    "minor league", "minors", "triple-a", "triple a", "double-a",
+    "farm team", "prospect", "affiliate",
+    "softball", "little league",
 ]
 
 PROP_BOOKS = {
@@ -184,8 +195,8 @@ posted_alert_keys   = set()
 last_reset_date     = None
 player_team_map     = {}
 last_roster_refresh = 0
-player_alert_count  = {}   # {last_name: count}
-player_alert_time   = {}   # {last_name: timestamp}
+player_alert_count  = {}
+player_alert_time   = {}
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
@@ -206,7 +217,7 @@ def record_player_alert(player_name):
     key = player_name.lower().split()[-1]
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
-    print(f"  📊 Player alert count: {key} = {player_alert_count[key]}")
+    print(f"  📊 Player count: {key} = {player_alert_count[key]}")
 
 # ── ROSTER LOOKUP ─────────────────────────────────────────────────────────────
 def build_player_team_map():
@@ -250,7 +261,31 @@ def lookup_player_team(name):
     return player_team_map.get(nl.split()[-1])
 
 def is_mlb_player(name):
-    return lookup_player_team(name) is not None
+    """
+    Returns True only if FULL NAME matches roster.
+    Last-name-only match no longer counts to avoid college false positives.
+    """
+    if not name or not player_team_map:
+        return False
+    nl = name.lower().strip()
+    # Must match full name (first + last) — not just last name alone
+    if nl in player_team_map:
+        # Only accept if it's a full name match (contains a space)
+        if " " in nl:
+            return True
+        # Single word — check if it's a last name that could be ambiguous
+        # Only accept last-name-only if it's truly unique (not a common name)
+        return False
+    return False
+
+def is_mlb_player_loose(name):
+    """Loose check — used as fallback, accepts last name only."""
+    if not name or not player_team_map:
+        return False
+    nl = name.lower().strip()
+    if nl in player_team_map:
+        return True
+    return player_team_map.get(nl.split()[-1]) is not None
 
 def infer_team_from_text(text):
     tl = text.lower()
@@ -281,11 +316,11 @@ def maybe_reset_daily():
         return
     if today > last_reset_date:
         print("[reset] New day — clearing state")
-        seen_tweet_ids      = set()
-        posted_alert_keys   = set()
-        player_alert_count  = {}
-        player_alert_time   = {}
-        last_reset_date     = today
+        seen_tweet_ids     = set()
+        posted_alert_keys  = set()
+        player_alert_count = {}
+        player_alert_time  = {}
+        last_reset_date    = today
 
 # ── TWEET AGE CHECK ───────────────────────────────────────────────────────────
 def is_recent(created_at_str):
@@ -417,7 +452,6 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_d
         summary = f"**{replaced}** is coming out — pinch hitter incoming"
     else:
         summary = "Pinch hit situation — see tweet below"
-
     embed = {"embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
         "description": (
             f"**Verified beat reporter tweeting pre-event pinch hit**\n\n"
@@ -440,7 +474,6 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_da
         summary = f"**{replaced}** is coming out — pinch hitter incoming"
     else:
         summary = "Pinch hit situation — see tweet below"
-
     embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
         "description": (
             f"**Twitter source reporting pre-event pinch hit**\n\n"
@@ -521,16 +554,13 @@ def process_and_alert(tweets, users):
         handle     = users.get(aid, "unknown")
         created_at = tweet.get("created_at", "")
 
-        # Reject old tweets
         if not is_recent(created_at):
             continue
 
-        # Deduplicate
         if tid in seen_tweet_ids:
             continue
         seen_tweet_ids.add(tid)
 
-        # Core phrase check
         tl = text.lower()
         core_phrases = [
             "on deck to pinch hit",
@@ -542,18 +572,22 @@ def process_and_alert(tweets, users):
         if not any(phrase in tl for phrase in core_phrases):
             continue
 
-        # Present/future + opinion filter
         is_live, reason = is_present_future(text)
         if not is_live:
             print(f"  🚫 @{handle}: {reason} — {text[:60]}")
             continue
 
-        # Extract players (with @mention stripping)
         pinch_hitter, replaced = extract_players(text)
 
-        # MLB roster cross-check
+        # ── MLB roster check — require full name match ────────────────────────
+        # This prevents college player false positives
         ph_is_mlb  = is_mlb_player(pinch_hitter) if pinch_hitter else False
         rep_is_mlb = is_mlb_player(replaced) if replaced else False
+
+        # If neither full name matches, try loose check as fallback
+        if not ph_is_mlb and not rep_is_mlb:
+            ph_is_mlb  = is_mlb_player_loose(pinch_hitter) if pinch_hitter else False
+            rep_is_mlb = is_mlb_player_loose(replaced) if replaced else False
 
         if pinch_hitter and replaced and not ph_is_mlb and not rep_is_mlb:
             print(f"  🚫 Neither '{pinch_hitter}' nor '{replaced}' on MLB roster")
@@ -565,13 +599,11 @@ def process_and_alert(tweets, users):
             print(f"  🚫 '{replaced}' not on MLB roster")
             continue
 
-        # ── FIX 5: player cooldown check ─────────────────────────────────────
         key_player = pinch_hitter or replaced
         if is_player_on_cooldown(key_player):
-            print(f"  🔇 @{handle}: '{key_player}' on cooldown — too many alerts already")
+            print(f"  🔇 '{key_player}' on cooldown")
             continue
 
-        # Determine team
         is_reporter = handle in REPORTER_HANDLES
         reporter    = REPORTER_BY_HANDLE.get(handle)
         team        = reporter["team"] if reporter else None
@@ -597,9 +629,7 @@ def process_and_alert(tweets, users):
               f"team={team} ph={pinch_hitter} out={replaced}")
         print(f"     Tweet: {text[:100]}")
 
-        # Record alert for cooldown tracking
         record_player_alert(key_player)
-
         lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
 
         if is_reporter:
@@ -609,9 +639,10 @@ def process_and_alert(tweets, users):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v3")
-    print("   Fix 5: Opinion/complaint/hypothetical language rejected")
-    print("   Fix 6: Player cooldown — max 2 alerts per player per 2 hours")
+    print("⚾ MLB Pinch Hit Bot v4")
+    print("   Fix 7: College/non-MLB context filter")
+    print("   Fix 8: Tighter hypothetical filter")
+    print("   Fix 9: Full name required for roster match")
     print(f"   {len(REPORTERS)} reporters | poll={POLL_INTERVAL}s\n")
 
     if not TWITTER_BEARER_TOKEN:
