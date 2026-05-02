@@ -8,11 +8,13 @@ import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from pinch_hit.alerts.discord import post_initial_alert
+from pinch_hit.alerts.discord import build_green_embed, post_initial_alert
+from pinch_hit.alerts.odds import schedule_odds_fetch
 from pinch_hit.config.reporters import REPORTERS
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing.tweet import (
     PINCH_HIT_PHRASES,
+    REPORTER_BY_HANDLE,
     build_player_team_map,
     process_tweet,
     refresh_if_stale,
@@ -48,7 +50,6 @@ def _build_reporter_rules() -> list[str]:
     current_len = 0
 
     for clause in clauses:
-        # " OR " separator is 4 chars
         added_len = len(clause) + (4 if current else 0)
         if current and current_len + added_len > _MAX_RULE_CHARS:
             rules.append(" OR ".join(current))
@@ -154,16 +155,32 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         print(f"[twitter error] failed to mark tweet seen {tweet_id}: {e}")
         return
 
+    reporter_info = REPORTER_BY_HANDLE.get(reporter_handle.lower())
+    reporter_display = reporter_info["handle"] if reporter_info else reporter_handle
+
     message_id = await post_initial_alert(
         pinch_hitter=result["pinch_hitter_raw"],
         team=result["team"],
         tweet_text=text,
+        reporter=reporter_display,
         client=client,
     )
 
     if not message_id:
         print(f"[twitter] Discord post failed for tweet {tweet_id} — skipping DB insert")
         return
+
+    base_embed = build_green_embed(
+        pinch_hitter=result["pinch_hitter_raw"],
+        team=result["team"],
+        tweet_text=text,
+        reporter=reporter_display,
+    )
+    schedule_odds_fetch(
+        player_last_name=result["pinch_hitter_raw"].split()[-1],
+        message_id=message_id,
+        base_embed=base_embed,
+    )
 
     try:
         await insert_pending_alert(
@@ -214,4 +231,8 @@ async def twitter_consumer() -> None:
                     await _handle_message(str(message), client)
             except ConnectionClosed:
                 print("[twitter] connection lost, reconnecting...")
+                continue
+            except Exception as e:
+                print(f"[twitter error] unexpected error in message loop: {e}")
+                await asyncio.sleep(1)
                 continue

@@ -101,7 +101,7 @@ async def build_player_team_map() -> None:
 
 
 async def refresh_if_stale() -> None:
-    """Refresh roster if 6h have elapsed since last fetch. Call before each tweet."""
+    """Called before each tweet parse."""
     if time.time() - last_roster_refresh >= 21600 or not player_team_map:
         async with _refresh_lock:
             if time.time() - last_roster_refresh >= 21600 or not player_team_map:
@@ -131,7 +131,8 @@ def is_recent(created_at_str: str | None) -> bool:
         tweet_time = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
         age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
         return age <= MAX_TWEET_AGE_SECS
-    except Exception:
+    except ValueError:
+        print(f"[tweet error] unparseable created_at: {created_at_str}")
         return True
 
 
@@ -217,34 +218,29 @@ async def process_tweet(
         "reject_reason": None,
     }
 
-    # 1. Age check
     if not is_recent(created_at):
         return {**base, "reject_reason": "tweet too old"}
 
-    # 2. Dedup
     if await is_seen_fn(tweet_id):
         return {**base, "reject_reason": "duplicate tweet_id"}
 
-    # 3. Phrase pre-filter (client-side AND with stream rule 2)
+    # Phrase pre-filter (client-side AND with stream rule 2)
     tl = text.lower()
     if not any(phrase in tl for phrase in PINCH_HIT_PHRASES):
         return {**base, "reject_reason": "no pinch-hit phrase"}
 
-    # 4. Tense filter (also checks REJECT_PHRASES)
     ok, reason = is_present_future(text)
     if not ok:
         return {**base, "reject_reason": reason}
 
-    # 5. Name extraction
     hitter_raw, replaced = extract_players(text)
     if not hitter_raw:
         return {**base, "reject_reason": "no player name extracted"}
 
-    # 6. Roster validation
     if not is_mlb_player(hitter_raw):
         return {**base, "reject_reason": f"not on active roster: {hitter_raw}"}
 
-    # 7. Reporter lookup — reject if tweet author isn't a known reporter
+    # Reject unknown reporters
     reporter = REPORTER_BY_HANDLE.get(reporter_handle.lower())
     if not reporter:
         return {**base, "reject_reason": f"unknown reporter handle: {reporter_handle}"}

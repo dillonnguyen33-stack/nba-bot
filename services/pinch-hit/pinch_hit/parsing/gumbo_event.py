@@ -1,7 +1,5 @@
 import re
 
-# Matches: "Offensive Substitution: Pinch-hitter <name> replaces <name>."
-# Captures everything between the fixed anchor words, strips trailing period.
 _GUMBO_PH_PATTERN = re.compile(
     r'Offensive Substitution: Pinch-hitter\s+(.+?)\s+replaces\s+(.+?)\.?\s*$',
     re.IGNORECASE,

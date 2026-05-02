@@ -8,6 +8,7 @@ EventType = Literal[
     "alert_fired",
     "tweet_rejected",
     "unmatched_substitution",
+    "confirmed_substitution",
     "twitter_degraded",
 ]
 
@@ -21,7 +22,7 @@ def _on_task_done(task: asyncio.Task[None]) -> None:
 
 
 async def _write_row(
-    event_type: str,
+    event_type: EventType,
     source: str,
     game_pk: int | None,
     pinch_hitter: str | None,

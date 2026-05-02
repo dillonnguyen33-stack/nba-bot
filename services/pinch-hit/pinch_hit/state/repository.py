@@ -57,12 +57,12 @@ async def get_pending_alerts_by_team(team_id: int) -> list[PendingAlertRow]:
     return [dict(row) for row in rows]
 
 
-async def update_alert_status(alert_id: int, status: AlertStatus) -> None:
+async def update_alert_status(alert_id: int, status: AlertStatus, game_pk: int | None = None) -> None:
     db = await get_db()
     if status == STATUS_CONFIRMED:
         await db.execute(
-            "UPDATE pending_alerts SET status = ?, confirmed_at = datetime('now') WHERE id = ?",
-            (status, alert_id),
+            "UPDATE pending_alerts SET status = ?, confirmed_at = datetime('now'), game_pk = COALESCE(?, game_pk) WHERE id = ?",
+            (status, game_pk, alert_id),
         )
     else:
         await db.execute(
