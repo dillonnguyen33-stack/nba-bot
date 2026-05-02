@@ -10,6 +10,8 @@ EventType = Literal[
     "unmatched_substitution",
     "confirmed_substitution",
     "twitter_degraded",
+    "alert_timeout",
+    "twitter_recovered",
 ]
 
 _background_tasks: set[asyncio.Task[None]] = set()

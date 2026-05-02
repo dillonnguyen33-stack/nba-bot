@@ -78,7 +78,7 @@ async def _fetch_current_embed(message_id: str, client: httpx.AsyncClient) -> di
         r = await client.get(f"{url}/messages/{message_id}")
         r.raise_for_status()
         return r.json()["embeds"][0]
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError, IndexError) as e:
+    except (httpx.HTTPError, ValueError, IndexError) as e:
         print(f"[gumbo error] fetch embed {message_id}: {type(e).__name__}: {e}")
         return None
 
@@ -228,7 +228,7 @@ async def _fetch_qualifying_games(client: httpx.AsyncClient) -> list[QualifyingG
         )
         r.raise_for_status()
         data = r.json()
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[gumbo error] schedule fetch: {type(e).__name__}: {e}")
         return []
 

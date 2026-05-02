@@ -79,7 +79,7 @@ async def _fetch_team_roster(
             entries[full_low] = team_name
             if len(parts) >= 2:
                 entries[parts[0].lower() + " " + last] = team_name
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[roster error] {team_name}: {type(e).__name__}: {e}")
     return entries
 

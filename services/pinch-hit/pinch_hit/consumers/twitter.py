@@ -23,8 +23,7 @@ from pinch_hit.state.repository import insert_pending_alert, insert_seen_tweet, 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-# Verify these endpoints against twitterapi.io documentation before shipping.
-# Auth is X-API-Key header (not Bearer token).
+# twitterapi.io uses X-API-Key header auth, not Bearer token.
 _RULES_URL = "https://api.twitterapi.io/twitter/tweet/search/stream/rule"
 _STREAM_WSS = "wss://stream.twitterapi.io/v1/tweet/search"
 
@@ -77,7 +76,7 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
             ids = [item["id"] for item in existing]
             await client.delete(_RULES_URL, headers=headers, json={"ids": ids})
             print(f"[twitter] deleted {len(ids)} existing rule(s)")
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[twitter] rule cleanup error: {type(e).__name__}: {e}")
 
     phrase_rule = " OR ".join(f'"{p}"' for p in PINCH_HIT_PHRASES)
@@ -93,7 +92,7 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         r = await client.post(_RULES_URL, headers=headers, json={"add": rules_to_add})
         r.raise_for_status()
         print(f"[twitter] filter rules registered: {r.json()}")
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[twitter] rule registration failed: {type(e).__name__}: {e}")
         raise  # Fatal — cannot consume stream without rules
 
@@ -232,6 +231,8 @@ async def twitter_consumer() -> None:
             except ConnectionClosed:
                 print("[twitter] connection lost, reconnecting...")
                 continue
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"[twitter error] unexpected error in message loop: {e}")
                 await asyncio.sleep(1)

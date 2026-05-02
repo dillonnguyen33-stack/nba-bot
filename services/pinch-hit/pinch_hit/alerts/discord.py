@@ -114,7 +114,7 @@ async def post_initial_alert(
     try:
         async with _ensure_client(client) as c:
             return await _post_wait(c, url, payload)
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[discord error] {type(e).__name__}: {e}")
         return None
 
@@ -142,7 +142,7 @@ async def patch_embed(
     try:
         async with _ensure_client(client) as c:
             await _patch(c, url, message_id, payload)
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[discord error] patch_embed {message_id}: {type(e).__name__}: {e}")
 
 
@@ -170,5 +170,5 @@ async def post_blue_alert(
             r = await c.post(url, json=payload)
             r.raise_for_status()
         print(f"[discord] posted blue alert for {pinch_hitter}")
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         print(f"[discord error] post_blue_alert: {type(e).__name__}: {e}")

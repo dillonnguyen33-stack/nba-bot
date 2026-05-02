@@ -3,3 +3,5 @@ builder = "RAILPACK"
 
 [deploy]
 startCommand = "python -m pinch_hit.main"
+healthcheckPath = "/health"
+healthcheckTimeout = 30

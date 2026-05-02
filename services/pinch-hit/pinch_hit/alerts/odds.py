@@ -70,7 +70,7 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
         r = await client.get(f"{ODDS_BASE}/events", params={"apiKey": api_key})
         r.raise_for_status()
         events = r.json()
-    except (httpx.HTTPError, httpx.TimeoutException):
+    except (httpx.HTTPError, ValueError):
         print("[odds error] failed to fetch events list")
         return {}
 
@@ -98,7 +98,7 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
                 )
                 r.raise_for_status()
                 data = r.json()
-            except (httpx.HTTPError, httpx.TimeoutException):
+            except (httpx.HTTPError, ValueError):
                 print(f"[odds error] failed to fetch odds for event={event_id} market={market}")
                 continue
 
