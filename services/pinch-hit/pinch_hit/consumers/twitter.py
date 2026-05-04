@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any
@@ -8,20 +9,47 @@ import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from pinch_hit.alerts.discord import build_green_embed, post_initial_alert
+from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert
 from pinch_hit.alerts.odds import schedule_odds_fetch
-from pinch_hit.config.reporters import REPORTERS
+from pinch_hit.config import REPORTERS
 from pinch_hit.eval.logger import log_event
+from pinch_hit.parsing import TweetResult
 from pinch_hit.parsing.tweet import (
     PINCH_HIT_PHRASES,
     REPORTER_BY_HANDLE,
-    build_player_team_map,
     process_tweet,
     refresh_if_stale,
 )
-from pinch_hit.state.repository import insert_pending_alert, insert_seen_tweet, is_tweet_seen
+from pinch_hit.state.repository import insert_pending_alert, is_tweet_seen, try_claim_tweet
+from pinch_hit.state.runtime import runtime_state
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+_PLAYER_COOLDOWN_SEC = 7200
+_PLAYER_MAX_ALERTS = 2
+_player_alert_count: dict[str, int] = {}
+_player_alert_time: dict[str, float] = {}
+
+
+def _is_player_on_cooldown(name: str) -> bool:
+    if not name:
+        return False
+    key = name.lower().strip()
+    now = time.time()
+    if key in _player_alert_time and now - _player_alert_time[key] > _PLAYER_COOLDOWN_SEC:
+        del _player_alert_count[key]
+        del _player_alert_time[key]
+        return False
+    return _player_alert_count.get(key, 0) >= _PLAYER_MAX_ALERTS
+
+
+def _record_player_alert(name: str) -> None:
+    if not name:
+        return
+    key = name.lower().strip()
+    _player_alert_count[key] = _player_alert_count.get(key, 0) + 1
+    _player_alert_time[key] = time.time()
+
 
 # twitterapi.io uses X-API-Key header auth, not Bearer token.
 _RULES_URL = "https://api.twitterapi.io/twitter/tweet/search/stream/rule"
@@ -29,16 +57,9 @@ _STREAM_WSS = "wss://stream.twitterapi.io/v1/tweet/search"
 
 _MAX_RULE_CHARS = 512
 
-# ── MODULE STATE ──────────────────────────────────────────────────────────────
-
-last_message_at: float = 0.0
-
 
 def _headers() -> dict[str, str]:
     return {"X-API-Key": os.environ.get("TWITTERAPI_IO_KEY", "")}
-
-
-# ── FILTER RULE REGISTRATION ──────────────────────────────────────────────────
 
 
 def _build_reporter_rules() -> list[str]:
@@ -74,10 +95,11 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         existing = r.json().get("data", [])
         if existing:
             ids = [item["id"] for item in existing]
-            await client.delete(_RULES_URL, headers=headers, json={"ids": ids})
-            print(f"[twitter] deleted {len(ids)} existing rule(s)")
-    except (httpx.HTTPError, ValueError) as e:
-        print(f"[twitter] rule cleanup error: {type(e).__name__}: {e}")
+            del_r = await client.request("DELETE", _RULES_URL, headers=headers, json={"ids": ids})
+            del_r.raise_for_status()
+            logger.info("deleted %s existing rule(s)", len(ids))
+    except (httpx.HTTPError, ValueError):
+        logger.exception("rule cleanup error")
 
     phrase_rule = " OR ".join(f'"{p}"' for p in PINCH_HIT_PHRASES)
     reporter_rules = _build_reporter_rules()
@@ -91,13 +113,10 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
     try:
         r = await client.post(_RULES_URL, headers=headers, json={"add": rules_to_add})
         r.raise_for_status()
-        print(f"[twitter] filter rules registered: {r.json()}")
-    except (httpx.HTTPError, ValueError) as e:
-        print(f"[twitter] rule registration failed: {type(e).__name__}: {e}")
+        logger.info("filter rules registered: %s", r.json())
+    except (httpx.HTTPError, ValueError):
+        logger.exception("rule registration failed")
         raise  # Fatal — cannot consume stream without rules
-
-
-# ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
 
 
 def _extract_reporter_handle(data: dict[str, Any], tweet: dict[str, Any]) -> str:
@@ -111,15 +130,13 @@ def _extract_reporter_handle(data: dict[str, Any], tweet: dict[str, Any]) -> str
 
 
 async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
-    global last_message_at
-    last_message_at = time.time()
-
     try:
         data: dict[str, Any] = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.warning("malformed JSON from stream: %s raw_prefix=%s", e, raw[:200])
         return
 
-    # twitterapi.io may wrap tweet in an envelope; adapt if format differs
+    # twitterapi.io wraps the tweet object in a "data" key; fall back to top-level
     tweet = data.get("data") or data
     tweet_id = str(tweet.get("id", ""))
     text = tweet.get("text", "")
@@ -127,11 +144,26 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
     reporter_handle = _extract_reporter_handle(data, tweet)
 
     if not tweet_id or not text or not reporter_handle:
+        logger.warning(
+            "dropping message: missing fields id=%s text=%s handle=%s",
+            bool(tweet_id),
+            bool(text),
+            bool(reporter_handle),
+        )
         return
+
+    # Update heartbeat AFTER validation so dropped messages don't mask a broken stream
+    runtime_state.last_twitter_message_at = time.time()
+
+    log_event(
+        "tweet_received",
+        source="twitter",
+        raw_payload={"tweet_id": tweet_id, "text": text, "reporter_handle": reporter_handle},
+    )
 
     await refresh_if_stale()
 
-    result = await process_tweet(
+    result: TweetResult = await process_tweet(
         tweet_id=tweet_id,
         text=text,
         created_at=created_at,
@@ -147,16 +179,26 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         )
         return
 
-    # Mark seen before Discord POST to prevent duplicate processing on race
-    try:
-        await insert_seen_tweet(tweet_id)
-    except Exception as e:
-        print(f"[twitter error] failed to mark tweet seen {tweet_id}: {e}")
+    # Player cooldown — prevent spam on the same player.
+    # Record optimistically before awaiting side effects to close the race window.
+    key_player = result["pinch_hitter_raw"]
+    if _is_player_on_cooldown(key_player):
+        logger.info("player %s on cooldown; skipping", key_player)
         return
+    _record_player_alert(key_player)
 
     reporter_info = REPORTER_BY_HANDLE.get(reporter_handle.lower())
     reporter_display = reporter_info["handle"] if reporter_info else reporter_handle
 
+    log_event(
+        "tweet_parsed",
+        source="twitter",
+        pinch_hitter=result["pinch_hitter_raw"],
+        team_id=result["team_id"],
+        raw_payload={"tweet_id": tweet_id, "text": text},
+    )
+
+    # Discord POST first: a duplicate alert is recoverable, a lost alert is not.
     message_id = await post_initial_alert(
         pinch_hitter=result["pinch_hitter_raw"],
         team=result["team"],
@@ -166,7 +208,20 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
     )
 
     if not message_id:
-        print(f"[twitter] Discord post failed for tweet {tweet_id} — skipping DB insert")
+        logger.error("Discord post failed for tweet %s; skipping DB insert", tweet_id)
+        return
+
+    try:
+        claimed = await try_claim_tweet(tweet_id)
+    except Exception:
+        logger.exception("failed to claim tweet %s", tweet_id)
+        if not await delete_message(message_id, client):
+            logger.critical("ORPHANED ALERT: message %s has no DB row and could not be deleted", message_id)
+        raise
+    if not claimed:
+        logger.info("duplicate tweet %s; deleting duplicate Discord alert", tweet_id)
+        if not await delete_message(message_id, client):
+            logger.error("ORPHANED DUPLICATE: message %s for tweet %s could not be deleted", message_id, tweet_id)
         return
 
     base_embed = build_green_embed(
@@ -174,11 +229,7 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         team=result["team"],
         tweet_text=text,
         reporter=reporter_display,
-    )
-    schedule_odds_fetch(
-        player_last_name=result["pinch_hitter_raw"].split()[-1],
-        message_id=message_id,
-        base_embed=base_embed,
+        include_odds_placeholder=bool(os.environ.get("ODDS_API_KEY", "")),
     )
 
     try:
@@ -190,9 +241,17 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
             tweet_id=tweet_id,
             replaced_player=result["replaced_player"],
         )
-    except Exception as e:
-        print(f"[twitter error] DB insert failed for tweet {tweet_id} (Discord alert orphaned): {e}")
-        return
+    except Exception:
+        logger.exception("DB insert failed for tweet %s; deleting Discord alert", tweet_id)
+        if not await delete_message(message_id, client):
+            logger.critical("ORPHANED ALERT: message %s has no DB row and could not be deleted", message_id)
+        raise
+
+    schedule_odds_fetch(
+        player_last_name=result["pinch_hitter_raw"].split()[-1],
+        message_id=message_id,
+        base_embed=base_embed,
+    )
 
     log_event(
         "alert_fired",
@@ -202,10 +261,7 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         raw_payload={"tweet_id": tweet_id, "text": text},
     )
 
-    print(f"[twitter] alert fired: {result['pinch_hitter_raw']} ({result['team']})")
-
-
-# ── CONSUMER LOOP ─────────────────────────────────────────────────────────────
+    logger.info("alert fired: %s (%s)", result["pinch_hitter_raw"], result["team"])
 
 
 async def twitter_consumer() -> None:
@@ -213,7 +269,7 @@ async def twitter_consumer() -> None:
     Persistent WebSocket consumer. Runs forever as an asyncio task.
     Uses websockets built-in reconnection with exponential backoff.
     """
-    await build_player_team_map()
+    await refresh_if_stale()
 
     async with httpx.AsyncClient(timeout=15) as client:
         await _register_rules(client)
@@ -225,15 +281,13 @@ async def twitter_consumer() -> None:
             ping_interval=30,
         ):
             try:
-                print("[twitter] WebSocket connected")
+                logger.info("WebSocket connected")
                 async for message in ws:
                     await _handle_message(str(message), client)
             except ConnectionClosed:
-                print("[twitter] connection lost, reconnecting...")
+                logger.info("connection lost, reconnecting")
                 continue
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"[twitter error] unexpected error in message loop: {e}")
+            except Exception:
+                logger.exception("unexpected error in message loop")
                 await asyncio.sleep(1)
                 continue
