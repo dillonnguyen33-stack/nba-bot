@@ -1,8 +1,10 @@
 import os
+import logging
 from pathlib import Path
 
 import aiosqlite
 
+logger = logging.getLogger(__name__)
 _db: aiosqlite.Connection | None = None
 
 
@@ -10,8 +12,8 @@ async def init_db() -> None:
     global _db
     if _db is not None:
         raise RuntimeError("DB already initialized")
-    db_path = os.getenv("DB_PATH", "/data/pinch-hit.db")
-    print(f"[db init] path={db_path}")
+    db_path = os.environ.get("DB_PATH", "/data/pinch-hit.db")
+    logger.info("DB init path=%s", db_path)
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     try:
         _db = await aiosqlite.connect(db_path)
@@ -19,8 +21,8 @@ async def init_db() -> None:
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         await _apply_migrations(_db)
-    except Exception as e:
-        print(f"[db init error] {e}")
+    except Exception:
+        logger.exception("DB init failed")
         _db = None
         raise
 
@@ -39,11 +41,24 @@ async def close_db() -> None:
 
 
 async def _apply_migrations(db: aiosqlite.Connection) -> None:
+    await db.execute("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY)")
+    await db.commit()
+
     migrations_dir = Path(__file__).parent.parent.parent / "migrations"
-    migration_file = migrations_dir / "001_initial.sql"
-    try:
-        sql = migration_file.read_text()
-        await db.executescript(sql)
-    except Exception as e:
-        print(f"[migration error] {migration_file}: {e}")
-        raise
+    for migration_file in sorted(migrations_dir.glob("*.sql")):
+        async with db.execute(
+            "SELECT 1 FROM _migrations WHERE name = ?", (migration_file.name,)
+        ) as cur:
+            if await cur.fetchone():
+                continue
+        try:
+            sql = migration_file.read_text()
+            await db.executescript(sql)
+            await db.execute(
+                "INSERT INTO _migrations (name) VALUES (?)", (migration_file.name,)
+            )
+            await db.commit()
+            logger.info("applied migration %s", migration_file.name)
+        except Exception:
+            logger.exception("migration failed: %s", migration_file)
+            raise

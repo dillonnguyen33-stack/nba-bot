@@ -11,8 +11,6 @@ import requests
 import discord
 from datetime import datetime
 from difflib import SequenceMatcher
-
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY")
 PLAYS_CHANNEL_ID  = 1461266015433396400
@@ -53,8 +51,6 @@ STAT_MAP = {
 
 STAT_SHORT = {"assists": "AST", "points": "PTS", "rebounds": "REB"}
 STAT_EMOJI = {"assists": "🎯", "points": "🏀", "rebounds": "💪"}
-
-# ── FUZZY MATCHING ────────────────────────────────────────────────────────────
 def fuzzy_score(a, b):
     """Return similarity ratio between two strings (0.0 to 1.0)."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
@@ -104,8 +100,6 @@ def best_fuzzy_match(query, candidates):
         return best_match, best_score
 
     return None, 0
-
-# ── PARSE PLAY ────────────────────────────────────────────────────────────────
 def parse_play(message):
     text = message.content.strip()
     print(f"[debug] Raw message: {repr(text)}")
@@ -164,8 +158,6 @@ def parse_play(message):
         "stat_type":   stat_type,
         "units":       units,
     }
-
-# ── NBA API ───────────────────────────────────────────────────────────────────
 def get_live_games():
     url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
     try:
@@ -268,8 +260,6 @@ def find_player_stats(player_raw, stat_type):
         "mins_remaining": best["mins_remaining"],
         "game_code":      best["game_code"],
     }
-
-# ── ODDS API ──────────────────────────────────────────────────────────────────
 def american_to_implied(odds):
     if odds > 0:
         return 100 / (odds + 100)
@@ -367,8 +357,6 @@ def get_all_book_odds(player_name, stat_type, line):
 
     avg_prob = sum(true_probs) / len(true_probs) if true_probs else None
     return book_over, avg_prob
-
-# ── CORRECTION ADJUSTMENT ─────────────────────────────────────────────────────
 def adjust_prob_for_correction(base_prob, line, corrected_stat):
     if base_prob is None:
         return None
@@ -380,8 +368,6 @@ def adjust_prob_for_correction(base_prob, line, corrected_stat):
         return base_prob
     ease_ratio = needed_official / max(needed_corrected, 0.5)
     return round(min(base_prob * ease_ratio, 0.96), 4)
-
-# ── KELLY & EV ────────────────────────────────────────────────────────────────
 def kelly_criterion(prob, best_odds):
     decimal    = american_to_decimal(best_odds)
     b          = decimal - 1
@@ -395,8 +381,6 @@ def kelly_criterion(prob, best_odds):
 
 def calculate_ev(prob, odds):
     return round(((prob * american_to_decimal(odds)) - 1) * 100, 1)
-
-# ── FORMAT OUTPUT ─────────────────────────────────────────────────────────────
 def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
     stat_short = STAT_SHORT.get(play["stat_type"], "")
     stat_emoji = STAT_EMOJI.get(play["stat_type"], "📊")
@@ -451,8 +435,6 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
         f"{kelly_section}\n"
         f"-# QK Bot · {datetime.utcnow().strftime('%H:%M UTC')}"
     )
-
-# ── DISCORD BOT ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)

@@ -1,13 +1,14 @@
-import asyncio
+import logging
 import os
 import time
-from typing import TypedDict
 
 import httpx
 
+from pinch_hit.alerts import DiscordEmbed, DiscordField, OddsLine
 from pinch_hit.alerts.discord import build_odds_fields, patch_embed
+from pinch_hit.state.background import schedule_background
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
 ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb"
 
@@ -24,19 +25,11 @@ MLB_PROP_MARKETS = ["batter_hits", "batter_total_bases", "batter_rbis", "batter_
 _CACHE_TTL = 60  # seconds
 
 
-# ── TYPES ────────────────────────────────────────────────────────────────────
-
-
-class OddsLine(TypedDict):
-    book: str
-    market: str
-    line: float
-    under: int
-
-
-# ── CACHE ────────────────────────────────────────────────────────────────────
-
 _cache: dict[tuple[str, str], tuple[float, dict[str, OddsLine]]] = {}
+
+
+class OddsFetchError(Exception):
+    pass
 
 
 def _get_cached(player_last_name: str, market: str) -> dict[str, OddsLine] | None:
@@ -55,12 +48,10 @@ def _set_cached(player_last_name: str, market: str, result: dict[str, OddsLine])
     _cache[(player_last_name, market)] = (time.time(), result)
 
 
-# ── FETCH ────────────────────────────────────────────────────────────────────
-
-
 async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) -> dict[str, OddsLine]:
     api_key = os.environ.get("ODDS_API_KEY", "")
     if not api_key:
+        logger.info("ODDS_API_KEY not set; skipping odds fetch")
         return {}
 
     last_name_lower = player_last_name.lower()
@@ -71,10 +62,15 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
         r.raise_for_status()
         events = r.json()
     except (httpx.HTTPError, ValueError):
-        print("[odds error] failed to fetch events list")
-        return {}
+        logger.exception("failed to fetch odds events list")
+        raise OddsFetchError("failed to fetch odds events list") from None
 
+    markets_found: set[str] = set()
+    had_fetch_error = False
     for event in events[:6]:
+        if len(markets_found) >= len(MLB_PROP_MARKETS):
+            break  # Got lines for all markets, stop burning API quota
+
         event_id = event.get("id")
         if not event_id:
             continue
@@ -83,6 +79,7 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
             cached = _get_cached(player_last_name, market)
             if cached is not None:
                 results.update(cached)
+                markets_found.add(market)
                 continue
 
             try:
@@ -99,7 +96,8 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
                 r.raise_for_status()
                 data = r.json()
             except (httpx.HTTPError, ValueError):
-                print(f"[odds error] failed to fetch odds for event={event_id} market={market}")
+                logger.exception("failed to fetch odds for event=%s market=%s", event_id, market)
+                had_fetch_error = True
                 continue
 
             per_market_results: dict[str, OddsLine] = {}
@@ -123,45 +121,58 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
                             "book": abbreviation,
                             "market": market_label,
                             "line": point,
-                            "under": price,
+                            "under_price": int(price),
                         }
 
             if per_market_results:
                 _set_cached(player_last_name, market, per_market_results)
                 results.update(per_market_results)
+                markets_found.add(market)
+
+    if not results and had_fetch_error:
+        raise OddsFetchError("failed to fetch any odds lines")
 
     return results
 
 
-# ── FIRE-AND-FORGET ──────────────────────────────────────────────────────────
-
-
-async def fetch_and_patch_odds(player_last_name: str, message_id: str, base_embed: dict) -> None:
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
+async def fetch_and_patch_odds(player_last_name: str, message_id: str, base_embed: DiscordEmbed) -> None:
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
             lines_data = await _fetch_player_lines(player_last_name, client)
-            if not lines_data:
-                print(f"[odds] no lines found for {player_last_name}")
-                return
+            odds_error = False
+        except OddsFetchError:
+            logger.exception("odds fetch failed for %s", player_last_name)
+            lines_data = {}
+            odds_error = True
+
+        base_fields = [f for f in base_embed.get("fields", []) if f["name"] != "Odds"]
+
+        if lines_data:
             odds_fields = build_odds_fields(lines_data)
-            patched_embed = {**base_embed, "fields": list(base_embed.get("fields", [])) + odds_fields}
-            await patch_embed(message_id, patched_embed, client)
-            print(f"[odds] patched message {message_id} with {len(odds_fields)} field(s) for {player_last_name}")
-    except Exception as e:
-        print(f"[odds error] fetch_and_patch_odds failed: {e}")
+            patched_embed: DiscordEmbed = {**base_embed, "fields": base_fields + odds_fields}
+        elif odds_error:
+            odds_error_field: DiscordField = {
+                "name": "Odds",
+                "value": "Odds unavailable (error)",
+                "inline": False,
+            }
+            patched_embed = {**base_embed, "fields": base_fields + [odds_error_field]}
+        else:
+            # Remove stale "Fetching odds..." placeholder
+            patched_embed = {**base_embed, "fields": base_fields}
+
+        success = await patch_embed(message_id, patched_embed, client)
+        if success and lines_data:
+            logger.info(
+                "patched message %s with %s odds field(s) for %s",
+                message_id,
+                len(odds_fields),
+                player_last_name,
+            )
+        elif not success:
+            logger.warning("odds patch failed for message %s", message_id)
 
 
-_background_tasks: set[asyncio.Task[None]] = set()
-
-
-def _on_task_done(task: asyncio.Task[None]) -> None:
-    _background_tasks.discard(task)
-    if not task.cancelled() and task.exception():
-        print(f"[odds error] background fetch failed: {task.exception()}")
-
-
-def schedule_odds_fetch(player_last_name: str, message_id: str, base_embed: dict) -> None:
+def schedule_odds_fetch(player_last_name: str, message_id: str, base_embed: DiscordEmbed) -> None:
     """Fire-and-forget entry point. Caller does not await."""
-    task = asyncio.create_task(fetch_and_patch_odds(player_last_name, message_id, base_embed))
-    _background_tasks.add(task)
-    task.add_done_callback(_on_task_done)
+    schedule_background(fetch_and_patch_odds(player_last_name, message_id, base_embed), "odds_fetch")

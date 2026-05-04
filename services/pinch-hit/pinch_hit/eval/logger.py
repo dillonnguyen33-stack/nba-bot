@@ -1,26 +1,12 @@
-import asyncio
 import json
-from typing import Any, Literal
+import logging
+from typing import Any
 
+from pinch_hit.state.background import schedule_background
 from pinch_hit.state.db import get_db
+from pinch_hit.types import EventType
 
-EventType = Literal[
-    "alert_fired",
-    "tweet_rejected",
-    "unmatched_substitution",
-    "confirmed_substitution",
-    "twitter_degraded",
-    "alert_timeout",
-    "twitter_recovered",
-]
-
-_background_tasks: set[asyncio.Task[None]] = set()
-
-
-def _on_task_done(task: asyncio.Task[None]) -> None:
-    _background_tasks.discard(task)
-    if not task.cancelled() and task.exception():
-        print(f"[eval log error] background write failed: {task.exception()}")
+logger = logging.getLogger(__name__)
 
 
 async def _write_row(
@@ -31,17 +17,14 @@ async def _write_row(
     team_id: int | None,
     raw_payload: str | None,
 ) -> None:
-    try:
-        db = await get_db()
-        await db.execute(
-            """INSERT INTO evaluation_log
-               (event_type, source, game_pk, pinch_hitter, team_id, raw_payload)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (event_type, source, game_pk, pinch_hitter, team_id, raw_payload),
-        )
-        await db.commit()
-    except Exception as e:
-        print(f"[eval log error] {e}")
+    db = await get_db()
+    await db.execute(
+        """INSERT INTO evaluation_log
+           (event_type, source, game_pk, pinch_hitter, team_id, raw_payload)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (event_type, source, game_pk, pinch_hitter, team_id, raw_payload),
+    )
+    await db.commit()
 
 
 def log_event(
@@ -54,8 +37,7 @@ def log_event(
 ) -> None:
     """Fire-and-forget — caller never awaits the write."""
     payload_str = json.dumps(raw_payload) if raw_payload is not None else None
-    task = asyncio.create_task(
-        _write_row(event_type, source, game_pk, pinch_hitter, team_id, payload_str)
+    schedule_background(
+        _write_row(event_type, source, game_pk, pinch_hitter, team_id, payload_str),
+        "eval_log",
     )
-    _background_tasks.add(task)
-    task.add_done_callback(_on_task_done)

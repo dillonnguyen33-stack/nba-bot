@@ -24,7 +24,7 @@ python -m pinch_hit.main
 | `ODDS_API_KEY` | — | No | The Odds API key; odds PATCH skipped if not set |
 | `DB_PATH` | `/data/pinch-hit.db` | No | Path to SQLite database file (Railway persistent volume mounts at `/data`) |
 | `GAME_HOURS_START` | `12` | No | UTC hour to start monitoring (noon UTC = 8 AM ET) |
-| `GAME_HOURS_END` | `25` | No | UTC hour to stop monitoring (25 = 1 AM UTC next day) |
+| `GAME_HOURS_END` | `6` | No | UTC hour to stop monitoring; wraps midnight when less than START |
 | `LATE_INNING_THRESHOLD` | `6` | No | Minimum inning to spawn a GUMBO subscriber for a game |
 | `TIMEOUT_MINUTES` | `5` | No | Minutes before a pending alert times out to grey |
 
