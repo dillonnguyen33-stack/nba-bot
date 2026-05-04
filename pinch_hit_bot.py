@@ -1,15 +1,16 @@
 """
-MLB Pinch Hit Alert Bot - Clean Rebuild v2
-Fixes:
-  1) MLB roster cross-check — at least one player must be on an active MLB roster
-  2) All reporters checked every cycle instead of rotating 6 per cycle
-  3) @ mentions stripped before player name extraction
-  4) Tweet age check — reject tweets older than 10 minutes
+MLB Pinch Hit Alert Bot - v5
+Key changes:
+  - Twitter Filtered Stream (real-time push instead of polling)
+  - REQUIRE at least one MLB player name — no player = no alert
+  - Tighter opinion/hypothetical/college filters
+  - Auto-reconnect on stream disconnect
 """
 
 import os
 import re
 import time
+import json
 import requests
 from datetime import datetime, timezone
 import pytz
@@ -18,9 +19,9 @@ import pytz
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
-POLL_INTERVAL        = 30
 ET_TZ                = pytz.timezone("America/New_York")
-MAX_TWEET_AGE_SECS   = 600   # reject tweets older than 10 minutes
+PLAYER_COOLDOWN_SEC  = 7200
+PLAYER_MAX_ALERTS    = 2
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -84,7 +85,6 @@ REPORTERS = [
 REPORTER_HANDLES   = {r["handle"].lower() for r in REPORTERS}
 REPORTER_BY_HANDLE = {r["handle"].lower(): r for r in REPORTERS}
 
-# ── TEAM ALIASES ──────────────────────────────────────────────────────────────
 TEAM_ALIASES = {
     "orioles": "Orioles", "baltimore": "Orioles",
     "red sox": "Red Sox", "boston": "Red Sox",
@@ -118,18 +118,19 @@ TEAM_ALIASES = {
     "giants": "Giants", "san francisco": "Giants",
 }
 
-# ── PRESENT/FUTURE MARKERS ────────────────────────────────────────────────────
 PRESENT_FUTURE_MARKERS = [
     r'\bis\b', r'\bwill\b', r'\bslated\b', r'\bon\s+deck\b',
     r'\bexpected\b', r'\bgoing\s+to\b', r'\bset\s+to\b',
     r'\bcoming\s+up\b', r'\bheading\b', r'\bwarming\b',
     r'\bscheduled\b', r'\bdue\s+to\b', r'\bappears\b',
-    r'\blooks\s+like\b', r'\bshould\b', r'\bunclear\b',
+    r'\blooks\s+like\b', r'\bunclear\b',
     r'\btaking\s+over\b', r'\bcoming\s+in\b',
+    r'\bout\s+of\s+the\s+game\b', r'\bleft\s+the\s+game\b',
 ]
 
-# ── REJECT PHRASES ────────────────────────────────────────────────────────────
+# ── REJECT PHRASES ─────────────────────────────────────────────────────────────
 REJECT_PHRASES = [
+    # Past tense / results
     "home run", "homered", "hit a", "singled", "doubled", "tripled",
     "drove in", "struck out", "flies out", "grounds out",
     "pinch-hit home run", "pinch hit home run",
@@ -140,9 +141,42 @@ REJECT_PHRASES = [
     "in the 4th", "in the 5th", "in the 6th",
     "in the 7th", "in the 8th", "in the 9th",
     "went 1-for", "went 0-for", "went 2-for",
+    # Opinion / complaint
+    "why pinch hit", "why would", "should have", "shouldn't have",
+    "should not have", "bad decision", "bad manager", "terrible decision",
+    "doesn't make sense", "makes no sense", "i hate when",
+    "can't believe", "cannot believe", "questionable",
+    "what a waste", "poor decision", "wrong decision",
+    "never should", "he keeps", "keeps making", "mistake",
+    "would you pinch", "if i were", "hypothetically",
+    "in theory", "imagine if", "what if",
+    "how often", "it's funny", "its funny", "funny how",
+    "rewards players", "punish", "not to blame",
+    "i would have", "i would not", "i wouldn't",
+    "unless he", "unless they", "unless the",
+    # Hypotheticals
+    "i predict", "i would probably", "i'd probably", "i'd pinch",
+    "always gets pinch", "routinely being", "routinely pinch",
+    "they tend to", "they usually", "he usually", "he always",
+    "probably pinch hit", "likely pinch hit", "might pinch hit",
+    "could pinch hit", "would pinch hit", "may pinch hit",
+    "i think", "bet they", "bet he", "so i predict",
+    "tomorrow", "next game", "next at bat", "next time",
+    "i really", "really expected", "i expected",
+    "my expectations", "for the record",
+    # Questions / complaints
+    "how is he not", "why is he not", "how is she not",
+    "not in the lineup", "not starting", "shouldn't be",
+    "how does", "why does", "why do they",
+    "?)",  # parenthetical questions like "(And routinely being pinch hit for?)"
+    # College / non-MLB
+    "mississippi state", "mississippi st", "husker",
+    "college", "university", "high school",
+    "ncaa", "minor league", "minors", "triple-a", "triple a", "double-a",
+    "farm team", "prospect", "affiliate",
+    "softball", "little league",
 ]
 
-# ── ODDS API ──────────────────────────────────────────────────────────────────
 PROP_BOOKS = {
     "draftkings":  "DraftKings",
     "fanduel":     "FanDuel",
@@ -162,14 +196,68 @@ MLB_TEAM_IDS = {
     "Diamondbacks": 109, "Rockies": 115, "Dodgers": 119, "Padres": 135, "Giants": 137,
 }
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
-seen_tweet_ids      = set()
-posted_alert_keys   = set()
-last_reset_date     = None
-player_team_map     = {}
-last_roster_refresh = 0
+# Stream filter rules — exact phrases that must appear in tweets
+STREAM_RULES = [
+    {"value": '"pinch hit for" -is:retweet lang:en',        "tag": "pinch_hit_for"},
+    {"value": '"pinch-hit for" -is:retweet lang:en',        "tag": "pinch_hit_for_hyph"},
+    {"value": '"on deck to pinch hit" -is:retweet lang:en', "tag": "on_deck"},
+    {"value": '"slated to pinch hit" -is:retweet lang:en',  "tag": "slated"},
+    {"value": '"will pinch hit" -is:retweet lang:en',       "tag": "will_ph"},
+]
 
-TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+# ── STATE ─────────────────────────────────────────────────────────────────────
+seen_tweet_ids     = set()
+posted_alert_keys  = set()
+last_reset_date    = None
+player_team_map    = {}
+last_roster_refresh = 0
+player_alert_count = {}
+player_alert_time  = {}
+
+TWITTER_HEADERS = {
+    "Authorization":  f"Bearer {TWITTER_BEARER_TOKEN}",
+    "Content-Type":   "application/json",
+}
+
+# ── GAME HOURS ────────────────────────────────────────────────────────────────
+def is_game_hours():
+    hour = datetime.now(ET_TZ).hour
+    return hour >= 12 or hour == 0
+
+# ── DAILY RESET ───────────────────────────────────────────────────────────────
+def maybe_reset_daily():
+    global seen_tweet_ids, last_reset_date, posted_alert_keys
+    global player_alert_count, player_alert_time
+    today = datetime.now(ET_TZ).date()
+    if last_reset_date is None:
+        last_reset_date = today
+        return
+    if today > last_reset_date:
+        print("[reset] New day — clearing state")
+        seen_tweet_ids     = set()
+        posted_alert_keys  = set()
+        player_alert_count = {}
+        player_alert_time  = {}
+        last_reset_date    = today
+
+# ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
+def is_player_on_cooldown(name):
+    if not name:
+        return False
+    key = name.lower().split()[-1]
+    now = time.time()
+    if key in player_alert_time:
+        if now - player_alert_time[key] > PLAYER_COOLDOWN_SEC:
+            player_alert_count[key] = 0
+    return player_alert_count.get(key, 0) >= PLAYER_MAX_ALERTS
+
+def record_player_alert(name):
+    if not name:
+        return
+    key = name.lower().split()[-1]
+    player_alert_count[key] = player_alert_count.get(key, 0) + 1
+    player_alert_time[key]  = time.time()
+    print(f"  📊 {key} alert count: {player_alert_count[key]}")
 
 # ── ROSTER LOOKUP ─────────────────────────────────────────────────────────────
 def build_player_team_map():
@@ -177,7 +265,7 @@ def build_player_team_map():
     now = time.time()
     if now - last_roster_refresh < 21600 and player_team_map:
         return
-    print("[roster] Refreshing MLB roster lookup...")
+    print("[roster] Refreshing MLB roster...")
     new_map = {}
     for team_name, team_id in MLB_TEAM_IDS.items():
         try:
@@ -191,12 +279,10 @@ def build_player_team_map():
                 if not full_name:
                     continue
                 parts    = full_name.split()
-                last     = parts[-1].lower()
                 full_low = full_name.lower()
-                new_map[last]     = team_name
                 new_map[full_low] = team_name
                 if len(parts) >= 2:
-                    new_map[parts[0].lower() + " " + last] = team_name
+                    new_map[parts[0].lower() + " " + parts[-1].lower()] = team_name
             time.sleep(0.2)
         except Exception as e:
             print(f"[roster error] {team_name}: {e}")
@@ -204,18 +290,18 @@ def build_player_team_map():
     last_roster_refresh = now
     print(f"[roster] {len(new_map)} entries loaded\n")
 
+def is_mlb_player(name):
+    """Requires full name (first + last) to match MLB roster."""
+    if not name or not player_team_map:
+        return False
+    nl = name.lower().strip()
+    return nl in player_team_map and " " in nl
+
 def lookup_player_team(name):
-    """Return team name if player is on an active MLB roster, else None."""
     if not name or not player_team_map:
         return None
     nl = name.lower().strip()
-    if nl in player_team_map:
-        return player_team_map[nl]
-    return player_team_map.get(nl.split()[-1])
-
-def is_mlb_player(name):
-    """Returns True if name matches any active MLB roster entry."""
-    return lookup_player_team(name) is not None
+    return player_team_map.get(nl)
 
 def infer_team_from_text(text):
     tl = text.lower()
@@ -228,61 +314,32 @@ def infer_team_from_text(text):
             two = (word + " " + words[i+1]).lower()
             if two in player_team_map:
                 return player_team_map[two]
-        if word.lower() in player_team_map:
-            return player_team_map[word.lower()]
     return None
-
-# ── GAME HOURS / RESET ────────────────────────────────────────────────────────
-def is_game_hours():
-    hour = datetime.now(ET_TZ).hour
-    return hour >= 12 or hour == 0
-
-def maybe_reset_daily():
-    global seen_tweet_ids, last_reset_date, posted_alert_keys
-    today = datetime.now(ET_TZ).date()
-    if last_reset_date is None:
-        last_reset_date = today
-        return
-    if today > last_reset_date:
-        print("[reset] New day — clearing state")
-        seen_tweet_ids    = set()
-        posted_alert_keys = set()
-        last_reset_date   = today
-
-# ── TWEET AGE CHECK ───────────────────────────────────────────────────────────
-def is_recent(created_at_str):
-    """Returns True if tweet was posted within MAX_TWEET_AGE_SECS."""
-    if not created_at_str:
-        return True  # if no timestamp, allow it
-    try:
-        tweet_time = datetime.fromisoformat(
-            created_at_str.replace("Z", "+00:00")
-        )
-        age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
-        return age <= MAX_TWEET_AGE_SECS
-    except:
-        return True
 
 # ── DETECTION ─────────────────────────────────────────────────────────────────
 def strip_mentions(text):
-    """Remove @mentions from text before extracting player names."""
     return re.sub(r'@\w+', '', text)
 
-def is_present_future(text):
+def is_valid_tweet(text):
+    """
+    Returns (True, reason) if tweet should fire an alert.
+    Returns (False, reason) if it should be rejected.
+    """
     tl = text.lower()
+
+    # Reject opinion/past/college/hypothetical language
     for phrase in REJECT_PHRASES:
         if phrase in tl:
-            return False, f"rejected: '{phrase}'"
+            return False, f"rejected phrase: '{phrase}'"
+
+    # Must have present/future tense marker
     for marker in PRESENT_FUTURE_MARKERS:
         if re.search(marker, text, re.IGNORECASE):
             return True, f"matched: '{marker}'"
+
     return False, "no present/future marker"
 
 def extract_players(text):
-    """
-    Extract (pinch_hitter, replaced_player).
-    Strips @mentions first to avoid treating Twitter handles as player names.
-    """
     clean = strip_mentions(text)
 
     patterns_both = [
@@ -291,6 +348,7 @@ def extract_players(text):
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+taking\s+over\s+\w+\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+ph(?:ing)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:has\s+)?left\s+the\s+game.*?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch',
     ]
     for p in patterns_both:
         m = re.search(p, clean)
@@ -302,6 +360,7 @@ def extract_players(text):
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch[- ]hit',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?pinch[- ]hitting',
         r'(?:ph|pinch[- ]hit(?:ting)?)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for',
     ]
     for p in patterns_hitter:
         m = re.search(p, clean)
@@ -388,7 +447,6 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_d
         summary = f"**{replaced}** is coming out — pinch hitter incoming"
     else:
         summary = "Pinch hit situation — see tweet below"
-
     embed = {"embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
         "description": (
             f"**Verified beat reporter tweeting pre-event pinch hit**\n\n"
@@ -398,9 +456,9 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_d
             f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
         ),
         "color": 0x00FF00,
-        "footer": {"text": f"Beat Reporter · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
+        "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
     post_discord({"content": "@everyone 🔥 BEAT REPORTER", "embeds": embed["embeds"]})
-    print(f"  🟢 Reporter alert: {team} — {summary}")
+    print(f"  🟢 Reporter: {team} — {summary}")
 
 def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_data):
     if pinch_hitter and replaced:
@@ -411,7 +469,6 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_da
         summary = f"**{replaced}** is coming out — pinch hitter incoming"
     else:
         summary = "Pinch hit situation — see tweet below"
-
     embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
         "description": (
             f"**Twitter source reporting pre-event pinch hit**\n\n"
@@ -421,54 +478,143 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_da
             f"💰 **BET THE UNDER ON ALL LINES NOW**"
         ),
         "color": 0xF1C40F,
-        "footer": {"text": f"General Alert · {datetime.utcnow().strftime('%H:%M UTC')}"}}]}
+        "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
     post_discord({"content": "@everyone", "embeds": embed["embeds"]})
-    print(f"  🟡 General alert: {team} — {summary}")
+    print(f"  🟡 General: {team} — {summary}")
 
-# ── TWITTER ───────────────────────────────────────────────────────────────────
-def search_tweets(query, max_results=15):
+# ── CORE PROCESSING ───────────────────────────────────────────────────────────
+def handle_tweet(tid, text, handle):
+    """Process a single tweet and fire alert if valid."""
+    maybe_reset_daily()
+
+    # Game hours check
+    if not is_game_hours():
+        return
+
+    # Deduplicate
+    if tid in seen_tweet_ids:
+        return
+    seen_tweet_ids.add(tid)
+
+    # Core phrase check
+    tl = text.lower()
+    core_phrases = [
+        "on deck to pinch hit", "slated to pinch hit",
+        "pinch hit for", "pinch-hit for", "will pinch hit",
+        "getting pinch hit", "pinch hitting for",
+    ]
+    if not any(phrase in tl for phrase in core_phrases):
+        return
+
+    # Opinion / hypothetical / college filter
+    valid, reason = is_valid_tweet(text)
+    if not valid:
+        print(f"  🚫 @{handle}: {reason} — {text[:60]}")
+        return
+
+    # Extract player names
+    pinch_hitter, replaced = extract_players(text)
+
+    # ── CRITICAL: require at least one player name ────────────────────────────
+    if not pinch_hitter and not replaced:
+        print(f"  🚫 @{handle}: no player names found — skipping")
+        return
+
+    # ── MLB roster check — full name required ─────────────────────────────────
+    ph_is_mlb  = is_mlb_player(pinch_hitter) if pinch_hitter else False
+    rep_is_mlb = is_mlb_player(replaced)     if replaced     else False
+
+    if not ph_is_mlb and not rep_is_mlb:
+        print(f"  🚫 @{handle}: '{pinch_hitter}' / '{replaced}' not on MLB roster")
+        return
+
+    # Player cooldown
+    key_player = pinch_hitter or replaced
+    if is_player_on_cooldown(key_player):
+        print(f"  🔇 '{key_player}' on cooldown")
+        return
+
+    # Determine team
+    is_reporter = handle in REPORTER_HANDLES
+    reporter    = REPORTER_BY_HANDLE.get(handle)
+    team        = reporter["team"] if reporter else None
+
+    if not team:
+        team = lookup_player_team(pinch_hitter) or lookup_player_team(replaced)
+    if not team:
+        team = infer_team_from_text(text)
+    if not team:
+        team = "Unknown Team"
+
+    url       = f"https://twitter.com/{handle}/status/{tid}"
+    alert_key = tid
+
+    if alert_key in posted_alert_keys:
+        return
+    posted_alert_keys.add(alert_key)
+
+    print(f"  ✅ VALID: @{handle} ({'reporter' if is_reporter else 'general'}) "
+          f"team={team} ph={pinch_hitter} out={replaced}")
+    print(f"     {text[:120]}")
+
+    record_player_alert(key_player)
+    lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
+
+    if is_reporter:
+        post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
+    else:
+        post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
+
+# ── TWITTER STREAM ────────────────────────────────────────────────────────────
+def get_stream_rules():
     try:
         r = requests.get(
-            "https://api.twitter.com/2/tweets/search/recent",
-            headers=TWITTER_HEADERS,
-            params={
-                "query":        query,
-                "max_results":  max_results,
-                "tweet.fields": "created_at,author_id,text",
-                "expansions":   "author_id",
-                "user.fields":  "username",
-            },
-            timeout=15
-        )
-        if r.status_code == 400:
-            print(f"[twitter 400] {query[:60]}")
-            return {}, []
-        if r.status_code == 503:
-            print(f"[twitter 503] service unavailable")
-            return {}, []
-        r.raise_for_status()
-        data   = r.json()
-        tweets = data.get("data", [])
-        users  = {u["id"]: u["username"].lower()
-                  for u in data.get("includes", {}).get("users", [])}
-        return users, tweets
-    except Exception as e:
-        print(f"[twitter error] {e}")
-        return {}, []
-
-def get_user_tweets(user_id, max_results=5):
-    try:
-        r = requests.get(
-            f"https://api.twitter.com/2/users/{user_id}/tweets",
-            headers=TWITTER_HEADERS,
-            params={"max_results": max_results,
-                    "tweet.fields": "created_at,text"},
-            timeout=10
+            "https://api.twitter.com/2/tweets/search/stream/rules",
+            headers=TWITTER_HEADERS, timeout=10
         )
         r.raise_for_status()
         return r.json().get("data", [])
-    except:
+    except Exception as e:
+        print(f"[stream rules error] {e}")
         return []
+
+def delete_stream_rules(rule_ids):
+    if not rule_ids:
+        return
+    try:
+        requests.post(
+            "https://api.twitter.com/2/tweets/search/stream/rules",
+            headers=TWITTER_HEADERS,
+            json={"delete": {"ids": rule_ids}},
+            timeout=10
+        )
+        print(f"[stream] Deleted {len(rule_ids)} old rules")
+    except Exception as e:
+        print(f"[stream rules delete error] {e}")
+
+def add_stream_rules():
+    try:
+        r = requests.post(
+            "https://api.twitter.com/2/tweets/search/stream/rules",
+            headers=TWITTER_HEADERS,
+            json={"add": STREAM_RULES},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        print(f"[stream] Added {len(data.get('data', []))} rules")
+        if data.get("errors"):
+            print(f"[stream rules errors] {data['errors']}")
+    except Exception as e:
+        print(f"[stream rules add error] {e}")
+
+def setup_stream_rules():
+    """Clear existing rules and add our rules."""
+    existing = get_stream_rules()
+    if existing:
+        delete_stream_rules([r["id"] for r in existing])
+    time.sleep(1)
+    add_stream_rules()
 
 def get_user_ids_batch(handles):
     try:
@@ -479,107 +625,118 @@ def get_user_ids_batch(handles):
             timeout=10
         )
         r.raise_for_status()
-        return {u["username"].lower(): u["id"]
-                for u in r.json().get("data", [])}
+        return {u["username"].lower(): u["id"] for u in r.json().get("data", [])}
     except Exception as e:
         print(f"[user id error] {e}")
         return {}
 
-# ── PROCESS AND ALERT ─────────────────────────────────────────────────────────
-def process_and_alert(tweets, users):
-    for tweet in tweets:
-        tid        = tweet.get("id") or ""
-        text       = tweet.get("text", "")
-        aid        = tweet.get("author_id", "")
-        handle     = users.get(aid, "unknown")
-        created_at = tweet.get("created_at", "")
+def get_user_tweets(user_id, max_results=3):
+    try:
+        r = requests.get(
+            f"https://api.twitter.com/2/users/{user_id}/tweets",
+            headers=TWITTER_HEADERS,
+            params={"max_results": max_results, "tweet.fields": "created_at,text"},
+            timeout=10
+        )
+        r.raise_for_status()
+        return r.json().get("data", [])
+    except:
+        return []
 
-        # ── FIX 4: reject old tweets ──────────────────────────────────────────
-        if not is_recent(created_at):
-            continue
+def connect_stream():
+    """Connect to filtered stream and yield tweet data."""
+    url = "https://api.twitter.com/2/tweets/search/stream"
+    params = {
+        "tweet.fields": "created_at,author_id,text",
+        "expansions":   "author_id",
+        "user.fields":  "username",
+    }
+    print("[stream] Connecting to filtered stream...")
+    r = requests.get(url, headers=TWITTER_HEADERS, params=params, stream=True, timeout=30)
+    if r.status_code != 200:
+        print(f"[stream error] HTTP {r.status_code}: {r.text[:200]}")
+        return
+    print("[stream] Connected! Listening for tweets...\n")
+    for line in r.iter_lines():
+        if line:
+            yield line
 
-        # Deduplicate
-        if tid in seen_tweet_ids:
-            continue
-        seen_tweet_ids.add(tid)
+def run_stream(user_ids):
+    """Main stream loop with auto-reconnect."""
+    reconnect_wait = 5
+    while True:
+        try:
+            for raw_line in connect_stream():
+                reconnect_wait = 5  # reset on successful data
+                maybe_reset_daily()
+                build_player_team_map()
 
-        # Core phrase check — must contain one of our target phrases
-        tl = text.lower()
-        core_phrases = [
-            "on deck to pinch hit",
-            "slated to pinch hit",
-            "pinch hit for",
-            "pinch-hit for",
-            "will pinch hit",
-        ]
-        if not any(phrase in tl for phrase in core_phrases):
-            continue
+                # Poll reporter timelines every ~60 seconds via a side check
+                # (stream handles general Twitter, we still want reporters)
+                try:
+                    data = json.loads(raw_line)
+                except:
+                    continue
 
-        # Present/future tense check
-        is_live, reason = is_present_future(text)
-        if not is_live:
-            print(f"  🚫 @{handle}: {reason} — {text[:60]}")
-            continue
+                tweet_data = data.get("data", {})
+                includes   = data.get("includes", {})
+                users      = {u["id"]: u["username"].lower()
+                              for u in includes.get("users", [])}
 
-        # ── FIX 3: strip @mentions before extracting player names ─────────────
-        pinch_hitter, replaced = extract_players(text)
+                tid    = tweet_data.get("id", "")
+                text   = tweet_data.get("text", "")
+                aid    = tweet_data.get("author_id", "")
+                handle = users.get(aid, "unknown")
 
-        # ── FIX 1: MLB roster cross-check ─────────────────────────────────────
-        # At least one player must be on an active MLB roster
-        ph_is_mlb  = is_mlb_player(pinch_hitter) if pinch_hitter else False
-        rep_is_mlb = is_mlb_player(replaced) if replaced else False
+                handle_tweet(tid, text, handle)
 
-        if pinch_hitter and replaced and not ph_is_mlb and not rep_is_mlb:
-            print(f"  🚫 @{handle}: neither '{pinch_hitter}' nor '{replaced}' on MLB roster — skipping")
-            continue
-        elif pinch_hitter and not replaced and not ph_is_mlb:
-            print(f"  🚫 @{handle}: '{pinch_hitter}' not on MLB roster — skipping")
-            continue
-        elif replaced and not pinch_hitter and not rep_is_mlb:
-            print(f"  🚫 @{handle}: '{replaced}' not on MLB roster — skipping")
-            continue
+        except requests.exceptions.ChunkedEncodingError:
+            print(f"[stream] Connection dropped — reconnecting in {reconnect_wait}s...")
+        except requests.exceptions.ConnectionError:
+            print(f"[stream] Connection error — reconnecting in {reconnect_wait}s...")
+        except Exception as e:
+            print(f"[stream] Error: {e} — reconnecting in {reconnect_wait}s...")
 
-        # Determine team
-        is_reporter = handle in REPORTER_HANDLES
-        reporter    = REPORTER_BY_HANDLE.get(handle)
-        team        = reporter["team"] if reporter else None
+        time.sleep(reconnect_wait)
+        reconnect_wait = min(reconnect_wait * 2, 60)  # exponential backoff, max 60s
 
-        if not team:
-            if pinch_hitter:
-                team = lookup_player_team(pinch_hitter)
-            if not team and replaced:
-                team = lookup_player_team(replaced)
-            if not team:
-                team = infer_team_from_text(text)
-            if not team:
-                team = "Unknown Team"
+# ── REPORTER POLLER ───────────────────────────────────────────────────────────
+def poll_reporters_forever(user_ids):
+    """
+    Runs in background — polls all reporter timelines every 30 seconds.
+    Catches reporter tweets that might not match our stream filter keywords.
+    """
+    import threading
 
-        url       = f"https://twitter.com/{handle}/status/{tid}"
-        alert_key = tid
+    def loop():
+        while True:
+            if is_game_hours():
+                for reporter in REPORTERS:
+                    handle = reporter["handle"].lower()
+                    uid    = user_ids.get(handle)
+                    if not uid:
+                        continue
+                    tweets = get_user_tweets(uid, max_results=3)
+                    for t in tweets:
+                        handle_tweet(
+                            t.get("id", ""),
+                            t.get("text", ""),
+                            handle
+                        )
+                    time.sleep(0.5)
+            time.sleep(30)
 
-        if alert_key in posted_alert_keys:
-            continue
-        posted_alert_keys.add(alert_key)
-
-        print(f"  ✅ VALID: @{handle} ({'reporter' if is_reporter else 'general'}) "
-              f"team={team} ph={pinch_hitter} out={replaced}")
-        print(f"     Tweet: {text[:100]}")
-
-        lines_data = get_player_lines(pinch_hitter) if pinch_hitter else {}
-
-        if is_reporter:
-            post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
-        else:
-            post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    print("[reporters] Background reporter polling started (every 30s)\n")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v2")
-    print("   Fix 1: MLB roster cross-check — filters non-MLB players")
-    print("   Fix 2: All reporters checked every cycle")
-    print("   Fix 3: @mentions stripped before player extraction")
-    print("   Fix 4: Tweets older than 10 min rejected")
-    print(f"   {len(REPORTERS)} reporters | poll={POLL_INTERVAL}s\n")
+    print("⚾ MLB Pinch Hit Bot v5 — Streaming Edition")
+    print("   Real-time Twitter Filtered Stream (no more polling delay)")
+    print("   REQUIRE player names — no name = no alert")
+    print("   Tighter opinion/hypothetical/college filters")
+    print(f"   {len(REPORTERS)} reporters monitored in background\n")
 
     if not TWITTER_BEARER_TOKEN:
         print("[error] TWITTER_BEARER_TOKEN not set!")
@@ -588,9 +745,10 @@ def run():
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
 
+    # Build roster
     build_player_team_map()
 
-    # ── FIX 2: look up ALL reporter IDs upfront ───────────────────────────────
+    # Get reporter user IDs
     print("Looking up reporter user IDs...")
     handles  = [r["handle"] for r in REPORTERS]
     user_ids = {}
@@ -598,67 +756,14 @@ def run():
         user_ids.update(get_user_ids_batch(handles[i:i+100]))
     print(f"Found {len(user_ids)} user IDs\n")
 
-    cycle = 0
+    # Set up stream filter rules
+    setup_stream_rules()
 
-    while True:
-        maybe_reset_daily()
-        build_player_team_map()
+    # Start reporter background poller
+    poll_reporters_forever(user_ids)
 
-        hour = datetime.now(ET_TZ).hour
-        if not (hour >= 12 or hour == 0):
-            print(f"[{datetime.now(ET_TZ).strftime('%H:%M ET')}] Outside game hours — sleeping 10 min")
-            time.sleep(600)
-            continue
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle {cycle}")
-
-        # ── Search 1: "on deck to pinch hit" — your best signal ─────────────
-        users1, tweets1 = search_tweets('"on deck to pinch hit" -is:retweet lang:en', 15)
-        print(f"   'on deck to pinch hit': {len(tweets1)} tweets")
-        process_and_alert(tweets1, users1)
-        time.sleep(2)
-
-        # ── Search 2: "slated to pinch hit" ──────────────────────────────────
-        users2, tweets2 = search_tweets('"slated to pinch hit" -is:retweet lang:en', 15)
-        print(f"   'slated to pinch hit': {len(tweets2)} tweets")
-        process_and_alert(tweets2, users2)
-        time.sleep(2)
-
-        # ── Search 3: "pinch hit for" — broad catch ───────────────────────────
-        users3, tweets3 = search_tweets('"pinch hit for" -is:retweet lang:en', 15)
-        print(f"   'pinch hit for': {len(tweets3)} tweets")
-        process_and_alert(tweets3, users3)
-        time.sleep(2)
-
-        # ── Search 4: "pinch-hit for" — hyphenated ────────────────────────────
-        users4, tweets4 = search_tweets('"pinch-hit for" -is:retweet lang:en', 15)
-        print(f"   'pinch-hit for': {len(tweets4)} tweets")
-        process_and_alert(tweets4, users4)
-        time.sleep(2)
-
-        # ── Search 5: "will pinch hit" — future tense ─────────────────────────
-        users5, tweets5 = search_tweets('"will pinch hit" -is:retweet lang:en', 15)
-        print(f"   'will pinch hit': {len(tweets5)} tweets")
-        process_and_alert(tweets5, users5)
-        time.sleep(2)
-
-        # ── FIX 2: check ALL reporters every cycle ────────────────────────────
-        rep_checked = 0
-        for reporter in REPORTERS:
-            handle = reporter["handle"].lower()
-            uid    = user_ids.get(handle)
-            if not uid:
-                continue
-            tweets = get_user_tweets(uid, max_results=3)
-            for t in tweets:
-                t["author_id"] = uid
-            process_and_alert(tweets, {uid: handle})
-            rep_checked += 1
-            time.sleep(0.5)
-
-        print(f"   Checked {rep_checked} reporter timelines")
-        cycle += 1
-        time.sleep(POLL_INTERVAL)
+    # Start main stream (blocks forever, auto-reconnects)
+    run_stream(user_ids)
 
 if __name__ == "__main__":
     run()
