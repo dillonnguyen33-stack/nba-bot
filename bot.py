@@ -8,8 +8,6 @@ import sqlite3
 import requests
 import os
 from datetime import datetime
-
-# ── CONFIG ──────────────────────────────────────────────────────────────────
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discordapp.com/api/webhooks/1486803328766574753/lVrHREVTqTkWiKl0rL1LKx8RuGZkJdD3IE1ZXXZ1YQi9z77IEzIeesP_GKLLn5r1lxgo")
 POLL_INTERVAL_SECONDS = 10
 DB_PATH = os.environ.get("DB_PATH", "corrections.db")
@@ -25,8 +23,6 @@ COLORS = {
     "points":  0x9B59B6,   # purple
     "rebound": 0x3498DB,   # blue
 }
-
-# ── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -84,8 +80,6 @@ def save_correction(game_id, play_id, player, stat, old_val, new_val,
     except sqlite3.IntegrityError:
         conn.close()
         return False  # already saved — do not post
-
-# ── NBA API ───────────────────────────────────────────────────────────────────
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer":    "https://www.nba.com/",
@@ -116,8 +110,6 @@ def get_play_by_play(game_id):
     except Exception as e:
         print(f"[pbp error game {game_id}] {e}")
         return {}
-
-# ── CORRECTION DETECTION ─────────────────────────────────────────────────────
 def classify_correction(stat, old_val, new_val, old_player, new_player):
     if stat == "ast":
         if old_player and not new_player:
@@ -146,8 +138,6 @@ def diff_plays(old_play, new_play):
         diffs.append(("ast", old_ast, new_ast))
 
     return diffs
-
-# ── DISCORD ───────────────────────────────────────────────────────────────────
 def ordinal(n):
     return {1:"1st", 2:"2nd", 3:"3rd", 4:"4th"}.get(n, f"{n}th")
 
@@ -203,8 +193,6 @@ def post_to_discord(game, play, old_play, correction_type, label, stat,
         r.raise_for_status()
     except Exception as e:
         print(f"[discord error] {e}")
-
-# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 def run():
     init_db()
     print("🏀 NBA Correction Bot started. Polling every "
@@ -257,8 +245,6 @@ def run():
                     ctype, label = classify_correction(stat, old_v, new_v,
                                                        old_player, new_player)
                     elapsed = time.time() - first_seen
-
-                    # ── SAVE TO DATABASE FIRST, THEN POST ──
                     # This guarantees no duplicates even if bot crashes mid-post
                     saved = save_correction(
                         game_id, pid,

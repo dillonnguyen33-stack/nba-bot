@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pinch-hit"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite>=0.21",
+    "httpx>=0.27",
+    "rapidfuzz>=3.14",
+    "tzdata>=2024",
+    "websockets>=15.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pinch_hit*"]
