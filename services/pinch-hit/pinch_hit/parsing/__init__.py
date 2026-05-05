@@ -1,3 +1,3 @@
-from pinch_hit.parsing.tweet import TweetAccepted, TweetRejected, TweetResult
+from pinch_hit.parsing.tweet import TweetResult
 
-__all__ = ["TweetAccepted", "TweetRejected", "TweetResult"]
+__all__ = ["TweetResult"]

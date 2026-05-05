@@ -95,6 +95,13 @@ async def _fetch_player_lines(player_last_name: str, client: httpx.AsyncClient) 
                 )
                 r.raise_for_status()
                 data = r.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    logger.warning("rate limited fetching odds event=%s market=%s", event_id, market)
+                else:
+                    logger.exception("failed to fetch odds for event=%s market=%s", event_id, market)
+                had_fetch_error = True
+                continue
             except (httpx.HTTPError, ValueError):
                 logger.exception("failed to fetch odds for event=%s market=%s", event_id, market)
                 had_fetch_error = True
