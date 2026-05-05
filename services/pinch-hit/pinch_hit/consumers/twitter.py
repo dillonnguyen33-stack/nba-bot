@@ -52,7 +52,9 @@ def _record_player_alert(name: str) -> None:
 
 
 # twitterapi.io uses X-API-Key header auth, not Bearer token.
-_RULES_URL = "https://api.twitterapi.io/twitter/tweet/search/stream/rule"
+_ADD_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/add_rule"
+_GET_RULES_URL = "https://api.twitterapi.io/oapi/tweet_filter/get_rules"
+_DELETE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/delete_rule"
 _STREAM_WSS = "wss://stream.twitterapi.io/v1/tweet/search"
 
 _MAX_RULE_CHARS = 512
@@ -90,14 +92,18 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
     # Cleanup is best-effort — stale rules cause extra stream volume but don't break
     # processing. Registration failure is fatal (no rules = no stream data).
     try:
-        r = await client.get(_RULES_URL, headers=headers)
+        r = await client.get(_GET_RULES_URL, headers=headers)
         r.raise_for_status()
         existing = r.json().get("data", [])
         if existing:
-            ids = [item["id"] for item in existing]
-            del_r = await client.request("DELETE", _RULES_URL, headers=headers, json={"ids": ids})
-            del_r.raise_for_status()
-            logger.info("deleted %s existing rule(s)", len(ids))
+            for rule in existing:
+                rule_id = rule.get("rule_id") or rule.get("id")
+                if rule_id:
+                    del_r = await client.request(
+                        "DELETE", _DELETE_RULE_URL, headers=headers, json={"rule_id": rule_id}
+                    )
+                    del_r.raise_for_status()
+            logger.info("deleted %s existing rule(s)", len(existing))
     except (httpx.HTTPError, ValueError):
         logger.exception("rule cleanup error")
 
@@ -111,9 +117,10 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
     rules_to_add.append({"value": phrase_rule, "tag": "phrases"})
 
     try:
-        r = await client.post(_RULES_URL, headers=headers, json={"add": rules_to_add})
-        r.raise_for_status()
-        logger.info("filter rules registered: %s", r.json())
+        for rule in rules_to_add:
+            r = await client.post(_ADD_RULE_URL, headers=headers, json=rule)
+            r.raise_for_status()
+        logger.info("filter rules registered: %d rule(s)", len(rules_to_add))
     except (httpx.HTTPError, ValueError):
         logger.exception("rule registration failed")
         raise  # Fatal — cannot consume stream without rules
