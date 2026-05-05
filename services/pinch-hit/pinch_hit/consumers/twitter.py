@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -5,10 +6,11 @@ import time
 from typing import Any
 
 import httpx
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosedError
 
 from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert
 from pinch_hit.alerts.odds import schedule_odds_fetch
-from pinch_hit.config import REPORTERS
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing import TweetResult
 from pinch_hit.parsing.tweet import (
@@ -21,6 +23,9 @@ from pinch_hit.state.repository import insert_pending_alert, is_tweet_seen, try_
 from pinch_hit.state.runtime import runtime_state
 
 logger = logging.getLogger(__name__)
+
+_WS_URL = "wss://ws.twitterapi.io/twitter/tweet/websocket"
+_WS_RECONNECT_DELAY = 90.0
 
 _PLAYER_COOLDOWN_SEC = 7200
 _PLAYER_MAX_ALERTS = 2
@@ -53,7 +58,6 @@ _UPDATE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/update_rule"
 _GET_RULES_URL = "https://api.twitterapi.io/oapi/tweet_filter/get_rules"
 _DELETE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/delete_rule"
 
-_MAX_RULE_CHARS = 255
 _client: httpx.AsyncClient | None = None
 
 
@@ -61,33 +65,9 @@ def _headers() -> dict[str, str]:
     return {"x-api-key": os.environ.get("TWITTERAPI_IO_KEY", "")}
 
 
-def _build_reporter_rules() -> list[str]:
-    """Split reporter handles into rules that each fit under _MAX_RULE_CHARS."""
-    clauses = [f"from:{r['handle']}" for r in REPORTERS]
-    rules: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for clause in clauses:
-        added_len = len(clause) + (4 if current else 0)
-        if current and current_len + added_len > _MAX_RULE_CHARS:
-            rules.append(" OR ".join(current))
-            current = [clause]
-            current_len = len(clause)
-        else:
-            current.append(clause)
-            current_len += added_len
-
-    if current:
-        rules.append(" OR ".join(current))
-    return rules
-
-
 async def _register_rules(client: httpx.AsyncClient) -> None:
     headers = _headers()
 
-    # Cleanup is best-effort. Registration failure is fatal because no rules means
-    # twitterapi.io will not deliver matching webhook payloads.
     try:
         r = await client.get(_GET_RULES_URL, headers=headers)
         r.raise_for_status()
@@ -110,47 +90,32 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         logger.exception("rule cleanup error")
 
     phrase_rule = " OR ".join(f'"{p}"' for p in PINCH_HIT_PHRASES)
-    reporter_rules = _build_reporter_rules()
-
-    rules_to_add = [
-        {"value": rule, "tag": f"reporters_{chr(ord('a') + i)}", "interval_seconds": 100}
-        for i, rule in enumerate(reporter_rules)
-    ]
-    rules_to_add.append({"value": phrase_rule, "tag": "phrases", "interval_seconds": 100})
+    rule_payload = {"value": phrase_rule, "tag": "phrases", "interval_seconds": 100}
 
     try:
-        for rule in rules_to_add:
-            logger.info("adding rule: %s", rule)
-            r = await client.post(_ADD_RULE_URL, headers=headers, json=rule)
-            if r.status_code >= 400:
-                logger.error("add_rule failed: status=%s body=%s", r.status_code, r.text)
-            r.raise_for_status()
-            rule_id = r.json().get("rule_id")
-            if not rule_id:
-                logger.error("add_rule response missing rule_id: %s", r.text)
-                raise ValueError("add_rule response missing rule_id")
+        logger.info("adding rule: %s", rule_payload)
+        r = await client.post(_ADD_RULE_URL, headers=headers, json=rule_payload)
+        if r.status_code >= 400:
+            logger.error("add_rule failed: status=%s body=%s", r.status_code, r.text)
+        r.raise_for_status()
+        rule_id = r.json().get("rule_id")
+        if not rule_id:
+            logger.error("add_rule response missing rule_id: %s", r.text)
+            raise ValueError("add_rule response missing rule_id")
 
-            # Rules default to inactive — activate via update_rule with is_effect=1.
-            activate_r = await client.post(
-                _UPDATE_RULE_URL,
-                headers=headers,
-                json={
-                    "rule_id": rule_id,
-                    "tag": rule["tag"],
-                    "value": rule["value"],
-                    "interval_seconds": rule["interval_seconds"],
-                    "is_effect": 1,
-                },
-            )
-            if activate_r.status_code >= 400:
-                logger.error("update_rule failed: status=%s body=%s", activate_r.status_code, activate_r.text)
-            activate_r.raise_for_status()
-            logger.info("activated rule %s (tag=%s)", rule_id, rule["tag"])
-
-        logger.info("filter rules registered and activated: %d rule(s)", len(rules_to_add))
+        activate_r = await client.post(
+            _UPDATE_RULE_URL,
+            headers=headers,
+            json={**rule_payload, "rule_id": rule_id, "is_effect": 1},
+        )
+        if activate_r.status_code >= 400:
+            logger.error("update_rule failed: status=%s body=%s", activate_r.status_code, activate_r.text)
+        activate_r.raise_for_status()
+        logger.info("activated rule %s (tag=phrases)", rule_id)
+        logger.info("filter rules registered and activated: 1 rule")
     except (httpx.HTTPError, ValueError):
         logger.exception("rule registration failed")
-        raise  # Fatal — twitterapi.io will not deliver webhooks without rules
+        raise
 
 
 async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> None:
@@ -168,7 +133,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         )
         return
 
-    # Update heartbeat AFTER validation so dropped messages don't mask broken delivery.
     runtime_state.last_twitter_message_at = time.time()
 
     log_event(
@@ -195,7 +159,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         )
         return
 
-    # Record optimistically before awaiting side effects to close the race window.
     key_player = result["pinch_hitter_raw"]
     if _is_player_on_cooldown(key_player):
         logger.info("player %s on cooldown; skipping", key_player)
@@ -213,7 +176,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         raw_payload={"tweet_id": tweet_id, "text": text},
     )
 
-    # Discord POST first: a duplicate alert is recoverable, a lost alert is not.
     message_id = await post_initial_alert(
         pinch_hitter=result["pinch_hitter_raw"],
         team=result["team"],
@@ -308,33 +270,62 @@ async def close_twitter() -> None:
             _client = None
 
 
-async def handle_webhook_post(body: bytes) -> bool:
-    """Process a twitterapi.io webhook payload. Returns False on parse failure."""
-    if _client is None:
+async def twitter_consumer() -> None:
+    """Persistent WebSocket consumer for twitterapi.io tweet delivery."""
+    client = _client
+    if client is None:
         raise RuntimeError("twitter client is not initialized")
 
-    try:
-        payload: Any = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error("malformed webhook body: %s raw_prefix=%r", e, body[:200])
-        return False
+    api_key = os.environ.get("TWITTERAPI_IO_KEY", "")
+    extra_headers = {"x-api-key": api_key}
 
-    # twitterapi.io webhook format: {"event_type":"tweet","tweets":[...],...}
-    # Extract the tweets array; fall back to treating payload as a list or single tweet.
-    if isinstance(payload, dict) and "tweets" in payload:
-        tweets = payload["tweets"]
-    elif isinstance(payload, list):
-        tweets = payload
-    else:
-        tweets = [payload]
-
-    for tweet in tweets:
-        if not isinstance(tweet, dict):
-            logger.warning("dropping webhook item: expected object got=%s", type(tweet).__name__)
-            continue
+    while True:
         try:
-            await _handle_message(tweet, _client)
-        except Exception:
-            logger.exception("failed to process webhook message id=%s", tweet.get("id", "?"))
+            async with connect(_WS_URL, additional_headers=extra_headers) as ws:
+                logger.info("WebSocket connected to %s", _WS_URL)
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        logger.warning("non-JSON WebSocket message: %r", raw[:200] if isinstance(raw, (str, bytes)) else raw)
+                        continue
 
-    return True
+                    event_type = msg.get("event_type", "")
+
+                    if event_type == "connected":
+                        logger.info("WebSocket handshake confirmed: %s", msg.get("message", ""))
+                        runtime_state.last_twitter_message_at = time.time()
+
+                    elif event_type == "ping":
+                        runtime_state.last_twitter_message_at = time.time()
+
+                    elif event_type == "tweet":
+                        tweets = msg.get("tweets", [])
+                        for tweet in tweets:
+                            if not isinstance(tweet, dict):
+                                continue
+                            try:
+                                await _handle_message(tweet, client)
+                            except Exception:
+                                logger.exception("failed to process WS tweet id=%s", tweet.get("id", "?"))
+
+                    elif event_type == "fast_tweet":
+                        logger.debug("fast_tweet event (stream-only); skipping")
+
+                    else:
+                        logger.debug("unhandled WS event_type=%s", event_type)
+
+        except asyncio.CancelledError:
+            raise
+        except ConnectionClosedError as e:
+            delay = 60.0 if e.rcvd and e.rcvd.code == 1013 else _WS_RECONNECT_DELAY
+            logger.warning(
+                "WebSocket closed code=%s reason=%s; reconnecting in %.0fs",
+                e.rcvd.code if e.rcvd else None,
+                e.rcvd.reason if e.rcvd else "",
+                delay,
+            )
+            await asyncio.sleep(delay)
+        except Exception:
+            logger.exception("WebSocket error; reconnecting in %.0fs", _WS_RECONNECT_DELAY)
+            await asyncio.sleep(_WS_RECONNECT_DELAY)
