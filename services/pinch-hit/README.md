@@ -27,6 +27,7 @@ python -m pinch_hit.main
 | `GAME_HOURS_END` | `6` | No | UTC hour to stop monitoring; wraps midnight when less than START |
 | `LATE_INNING_THRESHOLD` | `6` | No | Minimum inning to spawn a GUMBO subscriber for a game |
 | `TIMEOUT_MINUTES` | `5` | No | Minutes before a pending alert times out to grey |
+| `LOG_LEVEL` | `INFO` | No | Set to `DEBUG` to include raw tweet payload diagnostics |
 
 Railway injects `PORT` automatically — the `/health` endpoint binds to it (fallback: 8080).
 The bot connects to `wss://ws.twitterapi.io/twitter/tweet/websocket` using the `TWITTERAPI_IO_KEY` for authentication.

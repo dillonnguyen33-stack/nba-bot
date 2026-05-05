@@ -118,11 +118,33 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         raise
 
 
+def _get_nested_str(data: dict[str, Any], key: str, nested_key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        return ""
+    nested = value.get(nested_key)
+    return nested if isinstance(nested, str) else ""
+
+
+def _extract_reporter_handle(data: dict[str, Any]) -> str:
+    for handle in (
+        _get_nested_str(data, "author", "username"),
+        _get_nested_str(data, "user", "screen_name"),
+        _get_nested_str(data, "author", "userName"),
+        _get_nested_str(data, "author", "handle"),
+    ):
+        if handle:
+            return handle
+    return ""
+
+
 async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> None:
+    logger.debug("raw tweet payload: %s", json.dumps(data, sort_keys=True, default=str))
+
     tweet_id = str(data.get("id", ""))
     text = data.get("text", "")
     created_at = data.get("created_at") or data.get("createdAt")
-    reporter_handle = data.get("author", {}).get("username", "")
+    reporter_handle = _extract_reporter_handle(data)
 
     if not tweet_id or not text or not reporter_handle:
         logger.warning(
