@@ -111,14 +111,17 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
     reporter_rules = _build_reporter_rules()
 
     rules_to_add = [
-        {"value": rule, "tag": f"reporters_{chr(ord('a') + i)}"}
+        {"value": rule, "tag": f"reporters_{chr(ord('a') + i)}", "interval_seconds": 60}
         for i, rule in enumerate(reporter_rules)
     ]
-    rules_to_add.append({"value": phrase_rule, "tag": "phrases"})
+    rules_to_add.append({"value": phrase_rule, "tag": "phrases", "interval_seconds": 60})
 
     try:
         for rule in rules_to_add:
+            logger.info("adding rule: %s", rule)
             r = await client.post(_ADD_RULE_URL, headers=headers, json=rule)
+            if r.status_code >= 400:
+                logger.error("add_rule failed: status=%s body=%s", r.status_code, r.text)
             r.raise_for_status()
         logger.info("filter rules registered: %d rule(s)", len(rules_to_add))
     except (httpx.HTTPError, ValueError):
