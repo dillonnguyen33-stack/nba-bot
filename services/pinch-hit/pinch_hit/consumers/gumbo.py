@@ -216,6 +216,11 @@ async def _poll_game(
                         )
                     except Exception:
                         logger.exception("substitution handler failed game=%s", game_pk)
+                        from pinch_hit.state.background import schedule_background
+                        schedule_background(
+                            post_ops_alert(f"Substitution handler failed for game {game_pk}. A confirmation may have been missed."),
+                            "substitution_handler_error_ops",
+                        )
 
         last_play_count = len(all_plays)
 
@@ -267,8 +272,12 @@ async def _cancel_game_pool() -> None:
     _game_pool.clear()
 
 
+_MAX_CONSECUTIVE_OUTER_FAILURES = 5
+
+
 async def schedule_poller() -> None:
     consecutive_schedule_failures = 0
+    consecutive_outer_failures = 0
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             while True:
@@ -334,9 +343,16 @@ async def schedule_poller() -> None:
                     for gp in done_pks:
                         _game_pool.pop(gp, None)
 
+                    consecutive_outer_failures = 0
                     await asyncio.sleep(_SCHEDULE_POLL_INTERVAL)
                 except Exception:
-                    logger.exception("schedule poller failed")
+                    consecutive_outer_failures += 1
+                    logger.exception(
+                        "schedule poller failed consecutive_outer_failures=%s",
+                        consecutive_outer_failures,
+                    )
+                    if consecutive_outer_failures >= _MAX_CONSECUTIVE_OUTER_FAILURES:
+                        raise
                     await asyncio.sleep(_SCHEDULE_POLL_INTERVAL)
     finally:
         await _cancel_game_pool()

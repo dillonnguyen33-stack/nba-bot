@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import signal
@@ -9,6 +10,7 @@ from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -36,7 +38,7 @@ def _load_env() -> None:
 _load_env()
 
 from pinch_hit.consumers.gumbo import schedule_poller  # noqa: E402
-from pinch_hit.consumers.twitter import twitter_consumer  # noqa: E402
+from pinch_hit.consumers.twitter import close_twitter, handle_webhook_post, init_twitter  # noqa: E402
 from pinch_hit.logging_config import configure_logging  # noqa: E402
 from pinch_hit.state.background import drain_background_tasks  # noqa: E402
 from pinch_hit.state.db import close_db, init_db  # noqa: E402
@@ -63,42 +65,101 @@ async def _supervise(coro_fn: "Callable[[], Coroutine[Any, Any, None]]", name: s
             await asyncio.sleep(5)
 
 
-async def _handle_health(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+_MAX_BODY_BYTES = 1_048_576  # 1 MB
+_REQUEST_TIMEOUT = 30.0
+
+
+def _build_response(status: str, body: bytes) -> bytes:
+    return f"HTTP/1.0 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+
+
+async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[str, list[str]], bytes]:
+    # readuntil is implicitly capped at 64 KB by asyncio.StreamReader's buffer limit.
+    headers_raw = await reader.readuntil(b"\r\n\r\n")
+    header_text = headers_raw.decode("iso-8859-1")
+    lines = header_text.split("\r\n")
+    request_line = lines[0]
+    parts = request_line.split()
+    if len(parts) != 3:
+        raise ValueError("invalid request line")
+
+    method, target, _version = parts
+    parsed = urlsplit(target)
+    content_length = 0
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        if key.lower() == "content-length":
+            content_length = int(value.strip())
+            break
+
+    if content_length < 0 or content_length > _MAX_BODY_BYTES:
+        raise ValueError(f"invalid content-length: {content_length}")
+
+    body = await reader.readexactly(content_length) if content_length else b""
+    return method.upper(), parsed.path, parse_qs(parsed.query), body
+
+
+def _health_response() -> tuple[str, bytes]:
+    now = time.time()
+    schedule_gap = now - runtime_state.last_schedule_success_at
+    schedule_unhealthy = runtime_state.schedule_api_degraded or (
+        runtime_state.last_schedule_success_at > 0
+        and schedule_gap > 5 * 60
+    )
+
+    if not runtime_state.twitter_degraded and not schedule_unhealthy:
+        return "200 OK", b"ok"
+    if schedule_unhealthy:
+        return "503 Service Unavailable", f"unhealthy: schedule gap {schedule_gap:.0f}s".encode()
+    return "503 Service Unavailable", b"unhealthy: twitter degraded"
+
+
+async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        await reader.read(4096)  # consume HTTP request to prevent pipeline stall
+        try:
+            method, path, query, body = await asyncio.wait_for(
+                _read_http_request(reader), timeout=_REQUEST_TIMEOUT
+            )
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, UnicodeDecodeError, ValueError):
+            logger.warning("bad HTTP request")
+            writer.write(_build_response("400 Bad Request", b"bad request"))
+            await writer.drain()
+            return
+        except TimeoutError:
+            logger.warning("HTTP request timed out")
+            writer.write(_build_response("408 Request Timeout", b"request timeout"))
+            await writer.drain()
+            return
 
-        now = time.time()
-        schedule_gap = now - runtime_state.last_schedule_success_at
-        schedule_unhealthy = runtime_state.schedule_api_degraded or (
-            runtime_state.last_schedule_success_at > 0
-            and schedule_gap > 5 * 60
-        )
-
-        if not runtime_state.twitter_degraded and not schedule_unhealthy:
-            status = "200 OK"
-            body = b"ok"
-        elif schedule_unhealthy:
-            status = "503 Service Unavailable"
-            body = f"unhealthy: schedule gap {schedule_gap:.0f}s".encode()
+        if method == "GET" and path == "/health":
+            status, response_body = _health_response()
+        elif method == "POST" and path == "/webhook":
+            expected_secret = os.environ.get("TWITTER_WEBHOOK_SECRET", "")
+            if expected_secret and not hmac.compare_digest(
+                query.get("secret", [""])[0], expected_secret
+            ):
+                logger.warning("webhook secret mismatch")
+                status, response_body = "403 Forbidden", b"forbidden"
+            else:
+                parsed = await handle_webhook_post(body)
+                if parsed:
+                    status, response_body = "200 OK", b"ok"
+                else:
+                    status, response_body = "400 Bad Request", b"bad webhook payload"
         else:
-            status = "503 Service Unavailable"
-            body = b"unhealthy: twitter degraded"
+            status, response_body = "404 Not Found", b"not found"
 
-        response = f"HTTP/1.0 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
-        writer.write(response)
+        writer.write(_build_response(status, response_body))
         await writer.drain()
     except Exception:
-        logger.exception("health endpoint error")
+        logger.exception("HTTP endpoint error")
         try:
-            body = b"health endpoint error"
-            response = b"HTTP/1.0 500 Internal Server Error\r\nContent-Length: %d\r\n\r\n%s" % (
-                len(body),
-                body,
-            )
-            writer.write(response)
+            writer.write(_build_response("500 Internal Server Error", b"internal server error"))
             await writer.drain()
         except Exception:
-            logger.exception("failed to write health endpoint error response")
+            logger.exception("failed to write error response")
     finally:
         writer.close()
         await writer.wait_closed()
@@ -106,8 +167,8 @@ async def _handle_health(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 async def _health_server() -> None:
     port = int(os.environ.get("PORT", "8080"))
-    server = await asyncio.start_server(_handle_health, "0.0.0.0", port)
-    logger.info("/health listening on port %s", port)
+    server = await asyncio.start_server(_handle_http, "0.0.0.0", port)
+    logger.info("HTTP server listening on port %s", port)
     async with server:
         await server.serve_forever()
 
@@ -145,30 +206,37 @@ async def main() -> None:
         if not os.environ.get(var):
             raise RuntimeError(f"{var} must be set")
 
-    await init_db()
-    logger.info("DB initialized")
-
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, lambda: _request_shutdown("SIGTERM"))
-    loop.add_signal_handler(signal.SIGINT, lambda: _request_shutdown("SIGINT"))
-
-    logger.info("starting: twitter, gumbo, timeout, health, /health server, cleanup")
-
-    _main_task = asyncio.gather(
-        _supervise(twitter_consumer, "twitter"),
-        _supervise(schedule_poller, "gumbo"),
-        _supervise(timeout_watcher, "timeout"),
-        _supervise(health_monitor, "health"),
-        _supervise(_health_server, "health_server"),
-        _supervise(_nightly_cleanup_loop, "cleanup"),
-    )
-
     try:
-        await _main_task
-    except asyncio.CancelledError:
-        logger.info("cancelled; draining in-flight background tasks")
-        await drain_background_tasks(timeout=5.0)
+        await init_db()
+        logger.info("DB initialized")
+
+        await init_twitter()
+        logger.info("Twitter initialized")
+
+        if not os.environ.get("TWITTER_WEBHOOK_SECRET"):
+            logger.warning("TWITTER_WEBHOOK_SECRET is not set — webhook endpoint is unauthenticated")
+
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, lambda: _request_shutdown("SIGTERM"))
+        loop.add_signal_handler(signal.SIGINT, lambda: _request_shutdown("SIGINT"))
+
+        logger.info("starting: gumbo, timeout, health, HTTP server, cleanup")
+
+        _main_task = asyncio.gather(
+            _supervise(schedule_poller, "gumbo"),
+            _supervise(timeout_watcher, "timeout"),
+            _supervise(health_monitor, "health"),
+            _supervise(_health_server, "health_server"),
+            _supervise(_nightly_cleanup_loop, "cleanup"),
+        )
+
+        try:
+            await _main_task
+        except asyncio.CancelledError:
+            logger.info("cancelled; draining in-flight background tasks")
+            await drain_background_tasks(timeout=5.0)
     finally:
+        await close_twitter()
         await close_db()
         logger.info("shutdown complete")
 

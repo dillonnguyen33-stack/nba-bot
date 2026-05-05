@@ -82,7 +82,7 @@ REJECT_PHRASES = [
     "softball", "little league",
 ]
 
-# Must match the 5 phrases registered as stream filter Rule 2
+# Must match the phrases registered as the "phrases" filter rule in twitter.py
 PINCH_HIT_PHRASES = ["pinch hit", "pinch-hit", "ph for", "pinch hitting", "pinch-hitting"]
 
 REPORTER_BY_HANDLE: dict[str, Reporter] = {r["handle"].lower(): r for r in REPORTERS}
@@ -149,13 +149,6 @@ async def refresh_if_stale() -> None:
                 await build_player_team_map()
 
 
-def lookup_player_team(name: str) -> str | None:
-    if not name or not player_team_map:
-        return None
-    nl = name.lower().strip()
-    return player_team_map.get(nl)
-
-
 def is_mlb_player(name: str) -> bool:
     """Requires full name (first + last) to match MLB roster."""
     if not name or not player_team_map:
@@ -169,16 +162,22 @@ def normalize_player_last_name(name: str) -> str:
     return normalize_last_name(cleaned)
 
 
+_TWITTER_DATE_FMT = "%a %b %d %H:%M:%S %z %Y"
+
+
 def is_recent(created_at_str: str | None) -> bool:
     if not created_at_str:
         return True
     try:
         tweet_time = datetime.fromisoformat(created_at_str)
-        age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
-        return age <= MAX_TWEET_AGE_SECS
     except ValueError:
-        logger.warning("unparseable created_at=%s; rejecting as stale", created_at_str)
-        return False
+        try:
+            tweet_time = datetime.strptime(created_at_str, _TWITTER_DATE_FMT)
+        except ValueError:
+            logger.warning("unparseable created_at=%s; treating as recent", created_at_str)
+            return True
+    age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
+    return age <= MAX_TWEET_AGE_SECS
 
 
 def strip_mentions(text: str) -> str:
@@ -286,7 +285,7 @@ async def process_tweet(
     if await is_seen_fn(tweet_id):
         return {**base, "reject_reason": "duplicate tweet_id"}
 
-    # Phrase pre-filter (client-side AND with stream rule 2)
+    # Phrase pre-filter (client-side mirror of the "phrases" filter rule)
     tl = text.lower()
     if not any(phrase in tl for phrase in PINCH_HIT_PHRASES):
         return {**base, "reject_reason": "no pinch-hit phrase"}

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -6,8 +5,6 @@ import time
 from typing import Any
 
 import httpx
-from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed
 
 from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert
 from pinch_hit.alerts.odds import schedule_odds_fetch
@@ -51,17 +48,17 @@ def _record_player_alert(name: str) -> None:
     _player_alert_time[key] = time.time()
 
 
-# twitterapi.io uses X-API-Key header auth, not Bearer token.
 _ADD_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/add_rule"
+_UPDATE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/update_rule"
 _GET_RULES_URL = "https://api.twitterapi.io/oapi/tweet_filter/get_rules"
 _DELETE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/delete_rule"
-_STREAM_WSS = "wss://stream.twitterapi.io/v1/tweet/search"
 
-_MAX_RULE_CHARS = 512
+_MAX_RULE_CHARS = 255
+_client: httpx.AsyncClient | None = None
 
 
 def _headers() -> dict[str, str]:
-    return {"X-API-Key": os.environ.get("TWITTERAPI_IO_KEY", "")}
+    return {"x-api-key": os.environ.get("TWITTERAPI_IO_KEY", "")}
 
 
 def _build_reporter_rules() -> list[str]:
@@ -89,12 +86,12 @@ def _build_reporter_rules() -> list[str]:
 async def _register_rules(client: httpx.AsyncClient) -> None:
     headers = _headers()
 
-    # Cleanup is best-effort — stale rules cause extra stream volume but don't break
-    # processing. Registration failure is fatal (no rules = no stream data).
+    # Cleanup is best-effort. Registration failure is fatal because no rules means
+    # twitterapi.io will not deliver matching webhook payloads.
     try:
         r = await client.get(_GET_RULES_URL, headers=headers)
         r.raise_for_status()
-        existing = r.json().get("data", [])
+        existing = r.json().get("rules", [])
         if existing:
             for rule in existing:
                 rule_id = rule.get("rule_id") or rule.get("id")
@@ -104,6 +101,11 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
                     )
                     del_r.raise_for_status()
             logger.info("deleted %s existing rule(s)", len(existing))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            logger.error("auth failure during rule cleanup — API key may be invalid: %s", e)
+            raise
+        logger.error("rule cleanup failed (non-auth): %s", e)
     except (httpx.HTTPError, ValueError):
         logger.exception("rule cleanup error")
 
@@ -111,10 +113,10 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
     reporter_rules = _build_reporter_rules()
 
     rules_to_add = [
-        {"value": rule, "tag": f"reporters_{chr(ord('a') + i)}", "interval_seconds": 60}
+        {"value": rule, "tag": f"reporters_{chr(ord('a') + i)}", "interval_seconds": 100}
         for i, rule in enumerate(reporter_rules)
     ]
-    rules_to_add.append({"value": phrase_rule, "tag": "phrases", "interval_seconds": 60})
+    rules_to_add.append({"value": phrase_rule, "tag": "phrases", "interval_seconds": 100})
 
     try:
         for rule in rules_to_add:
@@ -123,35 +125,39 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
             if r.status_code >= 400:
                 logger.error("add_rule failed: status=%s body=%s", r.status_code, r.text)
             r.raise_for_status()
-        logger.info("filter rules registered: %d rule(s)", len(rules_to_add))
+            rule_id = r.json().get("rule_id")
+            if not rule_id:
+                logger.error("add_rule response missing rule_id: %s", r.text)
+                raise ValueError("add_rule response missing rule_id")
+
+            # Rules default to inactive — activate via update_rule with is_effect=1.
+            activate_r = await client.post(
+                _UPDATE_RULE_URL,
+                headers=headers,
+                json={
+                    "rule_id": rule_id,
+                    "tag": rule["tag"],
+                    "value": rule["value"],
+                    "interval_seconds": rule["interval_seconds"],
+                    "is_effect": 1,
+                },
+            )
+            if activate_r.status_code >= 400:
+                logger.error("update_rule failed: status=%s body=%s", activate_r.status_code, activate_r.text)
+            activate_r.raise_for_status()
+            logger.info("activated rule %s (tag=%s)", rule_id, rule["tag"])
+
+        logger.info("filter rules registered and activated: %d rule(s)", len(rules_to_add))
     except (httpx.HTTPError, ValueError):
         logger.exception("rule registration failed")
-        raise  # Fatal — cannot consume stream without rules
+        raise  # Fatal — twitterapi.io will not deliver webhooks without rules
 
 
-def _extract_reporter_handle(data: dict[str, Any], tweet: dict[str, Any]) -> str:
-    """Extract author username with fallback chain."""
-    users = (data.get("includes") or {}).get("users", [])
-    if users:
-        username = users[0].get("username", "")
-        if username:
-            return username
-    return tweet.get("author", {}).get("username", "")
-
-
-async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
-    try:
-        data: dict[str, Any] = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("malformed JSON from stream: %s raw_prefix=%s", e, raw[:200])
-        return
-
-    # twitterapi.io wraps the tweet object in a "data" key; fall back to top-level
-    tweet = data.get("data") or data
-    tweet_id = str(tweet.get("id", ""))
-    text = tweet.get("text", "")
-    created_at = tweet.get("created_at")
-    reporter_handle = _extract_reporter_handle(data, tweet)
+async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> None:
+    tweet_id = str(data.get("id", ""))
+    text = data.get("text", "")
+    created_at = data.get("created_at") or data.get("createdAt")
+    reporter_handle = data.get("author", {}).get("username", "")
 
     if not tweet_id or not text or not reporter_handle:
         logger.warning(
@@ -162,7 +168,7 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         )
         return
 
-    # Update heartbeat AFTER validation so dropped messages don't mask a broken stream
+    # Update heartbeat AFTER validation so dropped messages don't mask broken delivery.
     runtime_state.last_twitter_message_at = time.time()
 
     log_event(
@@ -189,7 +195,6 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
         )
         return
 
-    # Player cooldown — prevent spam on the same player.
     # Record optimistically before awaiting side effects to close the race window.
     key_player = result["pinch_hitter_raw"]
     if _is_player_on_cooldown(key_player):
@@ -274,30 +279,62 @@ async def _handle_message(raw: str, client: httpx.AsyncClient) -> None:
     logger.info("alert fired: %s (%s)", result["pinch_hitter_raw"], result["team"])
 
 
-async def twitter_consumer() -> None:
-    """
-    Persistent WebSocket consumer. Runs forever as an asyncio task.
-    Uses websockets built-in reconnection with exponential backoff.
-    """
+async def init_twitter() -> None:
+    """Initialize shared HTTP client and register twitterapi.io filter rules."""
+    global _client
+
     await refresh_if_stale()
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    client = httpx.AsyncClient(timeout=15)
+    try:
         await _register_rules(client)
+    except Exception:
+        await client.aclose()
+        raise
 
-        async for ws in connect(
-            _STREAM_WSS,
-            additional_headers=_headers(),
-            open_timeout=10,
-            ping_interval=30,
-        ):
-            try:
-                logger.info("WebSocket connected")
-                async for message in ws:
-                    await _handle_message(str(message), client)
-            except ConnectionClosed:
-                logger.info("connection lost, reconnecting")
-                continue
-            except Exception:
-                logger.exception("unexpected error in message loop")
-                await asyncio.sleep(1)
-                continue
+    _client = client
+
+
+async def close_twitter() -> None:
+    """Close shared HTTP client created by init_twitter()."""
+    global _client
+
+    if _client is not None:
+        try:
+            await _client.aclose()
+        except Exception:
+            logger.exception("error closing twitter client")
+        finally:
+            _client = None
+
+
+async def handle_webhook_post(body: bytes) -> bool:
+    """Process a twitterapi.io webhook payload. Returns False on parse failure."""
+    if _client is None:
+        raise RuntimeError("twitter client is not initialized")
+
+    try:
+        payload: Any = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.error("malformed webhook body: %s raw_prefix=%r", e, body[:200])
+        return False
+
+    # twitterapi.io webhook format: {"event_type":"tweet","tweets":[...],...}
+    # Extract the tweets array; fall back to treating payload as a list or single tweet.
+    if isinstance(payload, dict) and "tweets" in payload:
+        tweets = payload["tweets"]
+    elif isinstance(payload, list):
+        tweets = payload
+    else:
+        tweets = [payload]
+
+    for tweet in tweets:
+        if not isinstance(tweet, dict):
+            logger.warning("dropping webhook item: expected object got=%s", type(tweet).__name__)
+            continue
+        try:
+            await _handle_message(tweet, _client)
+        except Exception:
+            logger.exception("failed to process webhook message id=%s", tweet.get("id", "?"))
+
+    return True
