@@ -24,61 +24,17 @@ MLB_TEAM_IDS: dict[str, int] = {
     "Diamondbacks": 109, "Rockies": 115, "Dodgers": 119, "Padres": 135, "Giants": 137,
 }
 
-PRESENT_FUTURE_MARKERS = [
-    r'\bis\b', r'\bwill\b', r'\bslated\b', r'\bon\s+deck\b',
-    r'\bexpected\b', r'\bgoing\s+to\b', r'\bset\s+to\b',
-    r'\bcoming\s+up\b', r'\bheading\b', r'\bwarming\b',
-    r'\bscheduled\b', r'\bdue\s+to\b', r'\bappears\b',
-    r'\blooks\s+like\b', r'\bunclear\b',
-    r'\btaking\s+over\b', r'\bcoming\s+in\b',
-    r'\bout\s+of\s+the\s+game\b', r'\bleft\s+the\s+game\b',
-]
-
 REJECT_PHRASES = [
-    # Past tense / results
-    "home run", "homered", "hit a", "singled", "doubled", "tripled",
-    "drove in", "struck out", "flies out", "grounds out",
+    # Confirmed past results
+    "home run", "homered",
+    "singled", "doubled", "tripled",
+    "drove in",
     "pinch-hit home run", "pinch hit home run",
     "pinch-hit single", "pinch hit single",
-    "pinch-hit rbi", "pinch hit rbi",
-    "just hit", "last night", "yesterday",
-    "in the 1st", "in the 2nd", "in the 3rd",
-    "in the 4th", "in the 5th", "in the 6th",
-    "in the 7th", "in the 8th", "in the 9th",
-    "went 1-for", "went 0-for", "went 2-for",
-    # Opinion / complaint
-    "why pinch hit", "why would", "should have", "shouldn't have",
-    "should not have", "bad decision", "bad manager", "terrible decision",
-    "doesn't make sense", "makes no sense", "i hate when",
-    "can't believe", "cannot believe", "questionable",
-    "what a waste", "poor decision", "wrong decision",
-    "never should", "he keeps", "keeps making", "mistake",
-    "would you pinch", "if i were", "hypothetically",
-    "in theory", "imagine if", "what if",
-    "how often", "it's funny", "its funny", "funny how",
-    "rewards players", "punish", "not to blame",
-    "i would have", "i would not", "i wouldn't",
-    "unless he", "unless they", "unless the",
-    # Hypotheticals / predictions
-    "i predict", "i would probably", "i'd probably", "i'd pinch",
-    "always gets pinch", "routinely being", "routinely pinch",
-    "they tend to", "they usually", "he usually", "he always",
-    "probably pinch hit", "likely pinch hit", "might pinch hit",
-    "could pinch hit", "would pinch hit", "may pinch hit",
-    "i think", "bet they", "bet he",
-    "tomorrow", "next game", "next at bat", "next time",
-    "i really", "really expected", "i expected",
-    "my expectations", "for the record",
-    # Questions / complaints
-    "how is he not", "why is he not", "how is she not",
-    "not in the lineup", "not starting", "shouldn't be",
-    "how does", "why does", "why do they",
-    "?)",
-    # College / non-MLB
-    "mississippi state", "mississippi st", "husker",
-    "college", "university", "high school",
-    "ncaa", "minor league", "minors", "triple-a", "triple a", "double-a",
-    "farm team", "prospect", "affiliate",
+    "last night", "yesterday",
+    # Non-MLB context
+    "college", "university", "high school", "ncaa",
+    "minor league", "minors", "triple-a", "double-a",
     "softball", "little league",
 ]
 
@@ -184,22 +140,19 @@ def strip_mentions(text: str) -> str:
     return re.sub(r'@\w+', '', text)
 
 
-def is_present_future(text: str) -> tuple[bool, str]:
+def has_reject_phrase(text: str) -> tuple[bool, str | None]:
     tl = text.lower()
     for phrase in REJECT_PHRASES:
         if phrase in tl:
-            return False, f"rejected: '{phrase}'"
-    for marker in PRESENT_FUTURE_MARKERS:
-        if re.search(marker, text, re.IGNORECASE):
-            return True, f"matched: '{marker}'"
-    return False, "no present/future marker"
+            return True, phrase
+    return False, None
 
 
 def extract_players(text: str) -> tuple[str | None, str | None]:
     clean = strip_mentions(text)
 
     patterns_both = [
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+taking\s+over\s+\w+\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -210,32 +163,15 @@ def extract_players(text: str) -> tuple[str | None, str | None]:
         if m:
             return m.group(1).strip(), m.group(2).strip()
 
-    # "X left the game...Y will pinch" — group(1) is replaced, group(2) is hitter (inverted)
-    m = re.search(
+    inverted_patterns = [
+        r'[Pp]inch[- ][Hh]it(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)[,;:\s.—–\-]+(?:(?:is|will\s+be)\s+)?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:has\s+)?left\s+the\s+game.{0,100}?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch',
-        clean,
-    )
-    if m:
-        return m.group(2).strip(), m.group(1).strip()
-
-    # "X is getting pinch hit for" — X is the replaced player, hitter unknown
-    m = re.search(
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for',
-        clean,
-    )
-    if m:
-        return None, m.group(1).strip()
-
-    patterns_hitter = [
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:on\s+deck|slated|expected|set)\s+to\s+pinch[- ]hit',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch[- ]hit',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?pinch[- ]hitting',
-        r'(?:ph|pinch[- ]hit(?:ting)?)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
     ]
-    for p in patterns_hitter:
+    for p in inverted_patterns:
         m = re.search(p, clean)
         if m:
-            return m.group(1).strip(), None
+            return m.group(2).strip(), m.group(1).strip()
 
     return None, None
 
@@ -255,7 +191,7 @@ class TweetAccepted(TypedDict):
     team_id: int
     pinch_hitter_raw: str
     pinch_hitter_normalized: str
-    replaced_player: str | None
+    replaced_player: str
 
 
 TweetResult = TweetRejected | TweetAccepted
@@ -290,16 +226,19 @@ async def process_tweet(
     if not any(phrase in tl for phrase in PINCH_HIT_PHRASES):
         return {**base, "reject_reason": "no pinch-hit phrase"}
 
-    ok, reason = is_present_future(text)
-    if not ok:
-        return {**base, "reject_reason": reason}
+    rejected, phrase = has_reject_phrase(text)
+    if rejected:
+        return {**base, "reject_reason": f"rejected phrase: '{phrase}'"}
 
     hitter_raw, replaced = extract_players(text)
-    if not hitter_raw:
-        return {**base, "reject_reason": "no player name extracted"}
+    if not hitter_raw or not replaced:
+        return {**base, "reject_reason": f"need both player names — ph={hitter_raw} out={replaced}"}
 
     if not is_mlb_player(hitter_raw):
         return {**base, "reject_reason": f"not on active roster: {hitter_raw}"}
+
+    if not is_mlb_player(replaced):
+        return {**base, "reject_reason": f"not on active roster: {replaced}"}
 
     # Reject unknown reporters
     reporter = REPORTER_BY_HANDLE.get(reporter_handle.lower())
