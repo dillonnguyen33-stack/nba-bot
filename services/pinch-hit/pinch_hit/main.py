@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import os
 import signal
@@ -10,7 +9,6 @@ from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -38,7 +36,7 @@ def _load_env() -> None:
 _load_env()
 
 from pinch_hit.consumers.gumbo import schedule_poller  # noqa: E402
-from pinch_hit.consumers.twitter import close_twitter, handle_webhook_post, init_twitter  # noqa: E402
+from pinch_hit.consumers.twitter import close_twitter, init_twitter, twitter_consumer  # noqa: E402
 from pinch_hit.logging_config import configure_logging  # noqa: E402
 from pinch_hit.state.background import drain_background_tasks  # noqa: E402
 from pinch_hit.state.db import close_db, init_db  # noqa: E402
@@ -65,7 +63,6 @@ async def _supervise(coro_fn: "Callable[[], Coroutine[Any, Any, None]]", name: s
             await asyncio.sleep(5)
 
 
-_MAX_BODY_BYTES = 1_048_576  # 1 MB
 _REQUEST_TIMEOUT = 30.0
 
 
@@ -73,7 +70,7 @@ def _build_response(status: str, body: bytes) -> bytes:
     return f"HTTP/1.0 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
 
 
-async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, dict[str, list[str]], bytes]:
+async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str]:
     # readuntil is implicitly capped at 64 KB by asyncio.StreamReader's buffer limit.
     headers_raw = await reader.readuntil(b"\r\n\r\n")
     header_text = headers_raw.decode("iso-8859-1")
@@ -84,21 +81,8 @@ async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, di
         raise ValueError("invalid request line")
 
     method, target, _version = parts
-    parsed = urlsplit(target)
-    content_length = 0
-    for line in lines[1:]:
-        if not line or ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        if key.lower() == "content-length":
-            content_length = int(value.strip())
-            break
-
-    if content_length < 0 or content_length > _MAX_BODY_BYTES:
-        raise ValueError(f"invalid content-length: {content_length}")
-
-    body = await reader.readexactly(content_length) if content_length else b""
-    return method.upper(), parsed.path, parse_qs(parsed.query), body
+    path = target.split("?", 1)[0]
+    return method.upper(), path
 
 
 def _health_response() -> tuple[str, bytes]:
@@ -119,7 +103,7 @@ def _health_response() -> tuple[str, bytes]:
 async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         try:
-            method, path, query, body = await asyncio.wait_for(
+            method, path = await asyncio.wait_for(
                 _read_http_request(reader), timeout=_REQUEST_TIMEOUT
             )
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, UnicodeDecodeError, ValueError):
@@ -135,19 +119,6 @@ async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         if method == "GET" and path == "/health":
             status, response_body = _health_response()
-        elif method == "POST" and path == "/webhook":
-            expected_secret = os.environ.get("TWITTER_WEBHOOK_SECRET", "")
-            if expected_secret and not hmac.compare_digest(
-                query.get("secret", [""])[0], expected_secret
-            ):
-                logger.warning("webhook secret mismatch")
-                status, response_body = "403 Forbidden", b"forbidden"
-            else:
-                parsed = await handle_webhook_post(body)
-                if parsed:
-                    status, response_body = "200 OK", b"ok"
-                else:
-                    status, response_body = "400 Bad Request", b"bad webhook payload"
         else:
             status, response_body = "404 Not Found", b"not found"
 
@@ -213,16 +184,14 @@ async def main() -> None:
         await init_twitter()
         logger.info("Twitter initialized")
 
-        if not os.environ.get("TWITTER_WEBHOOK_SECRET"):
-            logger.warning("TWITTER_WEBHOOK_SECRET is not set — webhook endpoint is unauthenticated")
-
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, lambda: _request_shutdown("SIGTERM"))
         loop.add_signal_handler(signal.SIGINT, lambda: _request_shutdown("SIGINT"))
 
-        logger.info("starting: gumbo, timeout, health, HTTP server, cleanup")
+        logger.info("starting: twitter_ws, gumbo, timeout, health, HTTP server, cleanup")
 
         _main_task = asyncio.gather(
+            _supervise(twitter_consumer, "twitter_ws"),
             _supervise(schedule_poller, "gumbo"),
             _supervise(timeout_watcher, "timeout"),
             _supervise(health_monitor, "health"),

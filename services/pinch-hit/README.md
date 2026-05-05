@@ -1,6 +1,6 @@
 # Pinch-Hit Bot v2
 
-Async event-driven rewrite of the pinch-hit alert bot. Receives reporter tweets via twitterapi.io webhooks, confirms via MLB GUMBO, posts two-tier Discord alerts.
+Async event-driven rewrite of the pinch-hit alert bot. Receives reporter tweets via twitterapi.io WebSocket, confirms via MLB GUMBO, posts two-tier Discord alerts.
 
 ## Quick Start
 
@@ -18,9 +18,8 @@ python -m pinch_hit.main
 
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
-| `TWITTERAPI_IO_KEY` | — | Yes | twitterapi.io bearer token |
+| `TWITTERAPI_IO_KEY` | — | Yes | twitterapi.io API key |
 | `PINCH_HIT_WEBHOOK_URL` | — | Yes | Discord webhook URL for pinch-hit alerts |
-| `TWITTER_WEBHOOK_SECRET` | — | No | Shared secret expected as `/webhook?secret=...` for twitterapi.io delivery |
 | `OPS_WEBHOOK_URL` | — | No | Discord webhook URL for ops notifications (degradation alerts, recovery) |
 | `ODDS_API_KEY` | — | No | The Odds API key; odds PATCH skipped if not set |
 | `DB_PATH` | `/data/pinch-hit.db` | No | Path to SQLite database file (Railway persistent volume mounts at `/data`) |
@@ -30,7 +29,7 @@ python -m pinch_hit.main
 | `TIMEOUT_MINUTES` | `5` | No | Minutes before a pending alert times out to grey |
 
 Railway injects `PORT` automatically — the `/health` endpoint binds to it (fallback: 8080).
-Configure twitterapi.io to POST matches to `/webhook`, optionally with `?secret=<TWITTER_WEBHOOK_SECRET>`.
+The bot connects to `wss://ws.twitterapi.io/twitter/tweet/websocket` using the `TWITTERAPI_IO_KEY` for authentication.
 
 ## Shadow Validation
 
@@ -54,4 +53,4 @@ When v2 shadow validation passes:
 
 `GET /health` (port from `PORT` env var, fallback 8080):
 - `200 OK` — system healthy or outside game hours
-- `503 Service Unavailable` — Twitter webhook gap > 300s during game hours
+- `503 Service Unavailable` — Twitter WebSocket gap > 150s during game hours
