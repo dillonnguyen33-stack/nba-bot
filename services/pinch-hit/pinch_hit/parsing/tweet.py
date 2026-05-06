@@ -61,6 +61,16 @@ _PAST_TENSE_SIGNALS = [
     "in the 1st", "in the 2nd", "in the 3rd", "in the 4th",
     "in the 5th", "in the 6th", "in the 7th", "in the 8th", "in the 9th",
     "in the 10th", "in the 11th", "in the 12th",
+    # Result phrases — describe what already happened
+    "home run",
+    "pinch-hit home run", "pinch hit home run",
+    "pinch-hit single", "pinch hit single",
+    # Temporal — recap language
+    "last night", "yesterday",
+    # Non-MLB context — roster check covers most, but these are cheap guardrails
+    "college", "university", "high school", "ncaa",
+    "minor league", "minors", "triple-a", "double-a",
+    "softball", "little league",
 ]
 
 
@@ -247,6 +257,9 @@ async def process_tweet(
         "reporter_handle": reporter_handle,
         "reject_reason": "",
     }
+
+    if created_at is None:
+        return {**base, "reject_reason": "missing timestamp"}
 
     if not is_recent(created_at):
         return {**base, "reject_reason": "tweet too old"}

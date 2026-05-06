@@ -1,3 +1,3 @@
-from pinch_hit.alerts.types import DiscordEmbed, DiscordField, OddsLine
+from pinch_hit.alerts.types import DiscordEmbed, DiscordField
 
-__all__ = ["DiscordEmbed", "DiscordField", "OddsLine"]
+__all__ = ["DiscordEmbed", "DiscordField"]

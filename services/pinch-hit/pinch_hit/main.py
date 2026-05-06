@@ -130,9 +130,14 @@ async def _handle_test_tweet(reader: asyncio.StreamReader, content_length: int) 
     if client is None:
         return "503 Service Unavailable", b"twitter client not initialized"
 
-    # Fill in defaults so the message passes basic field checks
+    # Fill in defaults matching the WebSocket payload format
     data.setdefault("id", f"test-{int(time.time() * 1000)}")
-    data.setdefault("author", {"username": data.get("reporter_handle", "")})
+    if "screen_name" not in data:
+        data["screen_name"] = data.pop("reporter_handle", "")
+    if "created_ms" not in data and "created_at" not in data and "createdAt" not in data:
+        data["created_ms"] = int(time.time() * 1000)
+
+    data = twitter_mod._normalize_ws_tweet(data)
 
     try:
         await twitter_mod._handle_message(data, client)

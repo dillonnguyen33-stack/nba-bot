@@ -10,7 +10,6 @@ pip install -e .
 export TWITTERAPI_IO_KEY=...
 export PINCH_HIT_WEBHOOK_URL=...
 export OPS_WEBHOOK_URL=...
-export ODDS_API_KEY=...
 python -m pinch_hit.main
 ```
 
@@ -21,7 +20,6 @@ python -m pinch_hit.main
 | `TWITTERAPI_IO_KEY` | — | Yes | twitterapi.io API key |
 | `PINCH_HIT_WEBHOOK_URL` | — | Yes | Discord webhook URL for pinch-hit alerts |
 | `OPS_WEBHOOK_URL` | — | No | Discord webhook URL for ops notifications (degradation alerts, recovery) |
-| `ODDS_API_KEY` | — | No | The Odds API key; odds PATCH skipped if not set |
 | `DB_PATH` | `/data/pinch-hit.db` | No | Path to SQLite database file (Railway persistent volume mounts at `/data`) |
 | `GAME_HOURS_START` | `12` | No | UTC hour to start monitoring (noon UTC = 8 AM ET) |
 | `GAME_HOURS_END` | `6` | No | UTC hour to stop monitoring; wraps midnight when less than START |

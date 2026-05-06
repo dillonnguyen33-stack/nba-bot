@@ -38,7 +38,6 @@ def build_green_embed(
     team: str,
     tweet_text: str,
     reporter: str,
-    include_odds_placeholder: bool = False,  # kept for signature compat, ignored
 ) -> DiscordEmbed:
     fields: list[DiscordField] = [
         {"name": "Player", "value": pinch_hitter, "inline": True},
