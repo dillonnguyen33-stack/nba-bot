@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import httpx
 
-from pinch_hit.alerts import DiscordEmbed, DiscordField, OddsLine
+from pinch_hit.alerts import DiscordEmbed, DiscordField
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +38,15 @@ def build_green_embed(
     team: str,
     tweet_text: str,
     reporter: str,
-    include_odds_placeholder: bool = False,
+    include_odds_placeholder: bool = False,  # kept for signature compat, ignored
 ) -> DiscordEmbed:
     fields: list[DiscordField] = [
         {"name": "Player", "value": pinch_hitter, "inline": True},
         {"name": "Team", "value": team, "inline": True},
         {"name": "Reporter", "value": reporter, "inline": True},
     ]
-    if include_odds_placeholder:
-        fields.append({"name": "Odds", "value": "Fetching odds...", "inline": False})
     return {
-        "title": "Pinch hit detected",
+        "title": "⚾🚨 PINCH HIT ALERT — BET THE UNDER NOW",
         "description": tweet_text,
         "color": COLOR_GREEN,
         "fields": fields,
@@ -82,23 +80,6 @@ def build_blue_embed(pinch_hitter: str, team: str) -> DiscordEmbed:
             {"name": "Team", "value": team, "inline": True},
         ],
     }
-
-
-def build_odds_fields(lines_data: dict[str, OddsLine]) -> list[DiscordField]:
-    if not lines_data:
-        return []
-
-    by_market: dict[str, list[str]] = {}
-    for entry in lines_data.values():
-        market = entry["market"]
-        price = entry["under_price"]
-        formatted = f"{entry['book']} u{entry['line']} ({'+' if price > 0 else ''}{price})"
-        by_market.setdefault(market, []).append(formatted)
-
-    return [
-        {"name": market, "value": " | ".join(entries), "inline": False}
-        for market, entries in by_market.items()
-    ]
 
 
 async def post_startup_ping(client: httpx.AsyncClient | None = None) -> bool:
@@ -136,13 +117,7 @@ async def post_initial_alert(
         logger.error("PINCH_HIT_WEBHOOK_URL not set")
         return None
 
-    embed = build_green_embed(
-        pinch_hitter,
-        team,
-        tweet_text,
-        reporter,
-        include_odds_placeholder=bool(os.environ.get("ODDS_API_KEY", "")),
-    )
+    embed = build_green_embed(pinch_hitter, team, tweet_text, reporter)
     payload = {"content": "@everyone", "embeds": [embed]}
 
     try:
@@ -185,7 +160,6 @@ async def delete_message(
     message_id: str,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
-    """Returns True when the Discord message is gone or was accepted for deletion."""
     url = _webhook_url()
     if not url:
         logger.error("PINCH_HIT_WEBHOOK_URL not set")
@@ -298,5 +272,4 @@ async def _request_with_retries(
         )
         await asyncio.sleep(sleep_for)
 
-    # Unreachable: loop always returns or raises. Guard against _DISCORD_RETRIES=0.
     raise RuntimeError("_DISCORD_RETRIES must be >= 1")
