@@ -301,8 +301,7 @@ async def twitter_consumer() -> None:
                         logger.info("WebSocket handshake confirmed: %s", msg.get("message", ""))
                         runtime_state.last_twitter_message_at = time.time()
                         if not startup_pinged:
-                            await post_startup_ping(client)
-                            startup_pinged = True
+                            startup_pinged = await post_startup_ping(client)
 
                     elif event_type == "ping":
                         runtime_state.last_twitter_message_at = time.time()
