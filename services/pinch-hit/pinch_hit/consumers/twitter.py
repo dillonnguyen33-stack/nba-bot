@@ -9,7 +9,7 @@ import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
-from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert
+from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert, post_startup_ping
 from pinch_hit.alerts.odds import schedule_odds_fetch
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing import TweetResult
@@ -300,6 +300,7 @@ async def twitter_consumer() -> None:
 
     api_key = os.environ.get("TWITTERAPI_IO_KEY", "")
     extra_headers = {"x-api-key": api_key}
+    startup_pinged = False
 
     while True:
         try:
@@ -317,6 +318,9 @@ async def twitter_consumer() -> None:
                     if event_type == "connected":
                         logger.info("WebSocket handshake confirmed: %s", msg.get("message", ""))
                         runtime_state.last_twitter_message_at = time.time()
+                        if not startup_pinged:
+                            await post_startup_ping(client)
+                            startup_pinged = True
 
                     elif event_type == "ping":
                         runtime_state.last_twitter_message_at = time.time()
