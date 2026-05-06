@@ -101,6 +101,29 @@ def build_odds_fields(lines_data: dict[str, OddsLine]) -> list[DiscordField]:
     ]
 
 
+async def post_startup_ping(client: httpx.AsyncClient | None = None) -> bool:
+    url = _webhook_url()
+    if not url:
+        logger.error("PINCH_HIT_WEBHOOK_URL not set")
+        return False
+
+    embed: DiscordEmbed = {
+        "title": "Bot Online",
+        "description": "Pinch hit scanner is live and monitoring for plays.",
+        "color": COLOR_GREEN,
+    }
+    payload = {"embeds": [embed]}
+
+    try:
+        async with _ensure_client(client) as c:
+            await _request_with_retries(c, "POST", url, json=payload)
+        logger.info("startup ping sent")
+        return True
+    except (httpx.HTTPError, ValueError):
+        logger.exception("startup ping failed")
+        return False
+
+
 async def post_initial_alert(
     pinch_hitter: str,
     team: str,
