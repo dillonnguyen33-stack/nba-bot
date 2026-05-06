@@ -10,7 +10,6 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
 from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert, post_startup_ping
-from pinch_hit.alerts.odds import schedule_odds_fetch
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing import TweetResult
 from pinch_hit.parsing.tweet import (
@@ -223,14 +222,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
             logger.error("ORPHANED DUPLICATE: message %s for tweet %s could not be deleted", message_id, tweet_id)
         return
 
-    base_embed = build_green_embed(
-        pinch_hitter=result["pinch_hitter_raw"],
-        team=result["team"],
-        tweet_text=text,
-        reporter=reporter_display,
-        include_odds_placeholder=bool(os.environ.get("ODDS_API_KEY", "")),
-    )
-
     try:
         await insert_pending_alert(
             discord_message_id=message_id,
@@ -246,12 +237,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
             logger.critical("ORPHANED ALERT: message %s has no DB row and could not be deleted", message_id)
         raise
 
-    schedule_odds_fetch(
-        player_last_name=result["pinch_hitter_raw"].split()[-1],
-        message_id=message_id,
-        base_embed=base_embed,
-    )
-
     log_event(
         "alert_fired",
         source="twitter",
@@ -264,7 +249,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
 
 
 async def init_twitter() -> None:
-    """Initialize shared HTTP client and register twitterapi.io filter rules."""
     global _client
 
     await refresh_if_stale()
@@ -280,7 +264,6 @@ async def init_twitter() -> None:
 
 
 async def close_twitter() -> None:
-    """Close shared HTTP client created by init_twitter()."""
     global _client
 
     if _client is not None:
@@ -293,7 +276,6 @@ async def close_twitter() -> None:
 
 
 async def twitter_consumer() -> None:
-    """Persistent WebSocket consumer for twitterapi.io tweet delivery."""
     client = _client
     if client is None:
         raise RuntimeError("twitter client is not initialized")
