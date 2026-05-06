@@ -24,20 +24,6 @@ MLB_TEAM_IDS: dict[str, int] = {
     "Diamondbacks": 109, "Rockies": 115, "Dodgers": 119, "Padres": 135, "Giants": 137,
 }
 
-REJECT_PHRASES = [
-    # Confirmed past results
-    "home run", "homered",
-    "singled", "doubled", "tripled",
-    "drove in",
-    "pinch-hit home run", "pinch hit home run",
-    "pinch-hit single", "pinch hit single",
-    "last night", "yesterday",
-    # Non-MLB context
-    "college", "university", "high school", "ncaa",
-    "minor league", "minors", "triple-a", "double-a",
-    "softball", "little league",
-]
-
 # Must match the phrases registered as the "phrases" filter rule in twitter.py
 PINCH_HIT_PHRASES = ["pinch hit", "pinch-hit", "ph for", "pinch hitting", "pinch-hitting"]
 
@@ -140,14 +126,6 @@ def strip_mentions(text: str) -> str:
     return re.sub(r'@\w+', '', text)
 
 
-def has_reject_phrase(text: str) -> tuple[bool, str | None]:
-    tl = text.lower()
-    for phrase in REJECT_PHRASES:
-        if phrase in tl:
-            return True, phrase
-    return False, None
-
-
 def extract_players(text: str) -> tuple[str | None, str | None]:
     clean = strip_mentions(text)
 
@@ -173,6 +151,17 @@ def extract_players(text: str) -> tuple[str | None, str | None]:
         if m:
             return m.group(2).strip(), m.group(1).strip()
 
+    patterns_hitter_only = [
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\b',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\b',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit|ph)\b',
+        r'[Pp]inch[- ][Hh]it(?:ting)?[,;:\s.—–\-]+(?:(?:is|will\s+be)\s+)?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+    ]
+    for p in patterns_hitter_only:
+        m = re.search(p, clean)
+        if m:
+            return m.group(1).strip(), None
+
     return None, None
 
 
@@ -191,7 +180,7 @@ class TweetAccepted(TypedDict):
     team_id: int
     pinch_hitter_raw: str
     pinch_hitter_normalized: str
-    replaced_player: str
+    replaced_player: str | None
 
 
 TweetResult = TweetRejected | TweetAccepted
@@ -226,19 +215,12 @@ async def process_tweet(
     if not any(phrase in tl for phrase in PINCH_HIT_PHRASES):
         return {**base, "reject_reason": "no pinch-hit phrase"}
 
-    rejected, phrase = has_reject_phrase(text)
-    if rejected:
-        return {**base, "reject_reason": f"rejected phrase: '{phrase}'"}
-
     hitter_raw, replaced = extract_players(text)
-    if not hitter_raw or not replaced:
-        return {**base, "reject_reason": f"need both player names — ph={hitter_raw} out={replaced}"}
+    if not hitter_raw:
+        return {**base, "reject_reason": "no player name extracted"}
 
     if not is_mlb_player(hitter_raw):
         return {**base, "reject_reason": f"not on active roster: {hitter_raw}"}
-
-    if not is_mlb_player(replaced):
-        return {**base, "reject_reason": f"not on active roster: {replaced}"}
 
     # Reject unknown reporters
     reporter = REPORTER_BY_HANDLE.get(reporter_handle.lower())
