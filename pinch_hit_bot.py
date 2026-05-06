@@ -128,7 +128,6 @@ CORE_PHRASES = [
 ]
 
 # ── MINIMAL REJECT PHRASES — only clear post-result language ─────────────────
-# Keep this list SHORT. The roster check does the heavy lifting now.
 REJECT_PHRASES = [
     "home run", "homered",
     "singled", "doubled", "tripled",
@@ -253,7 +252,6 @@ def build_player_team_map():
     print(f"[roster] {len(new_map)} entries loaded\n")
 
 def is_mlb_player(name):
-    """Full name (first + last) must match active MLB roster."""
     if not name or not player_team_map:
         return False
     nl = name.lower().strip()
@@ -292,10 +290,7 @@ def has_reject_phrase(text):
     return False, None
 
 def extract_players(text):
-    """Extract (pinch_hitter, replaced_player). Both must be present."""
     clean = strip_mentions(text)
-
-    # Patterns that capture BOTH players
     patterns_both = [
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -310,7 +305,6 @@ def extract_players(text):
         m = re.search(p, clean)
         if m:
             return m.group(1).strip(), m.group(2).strip()
-
     return None, None
 
 # ── ODDS ──────────────────────────────────────────────────────────────────────
@@ -423,35 +417,28 @@ def handle_tweet(tid, text, handle):
         return
     seen_tweet_ids.add(tid)
 
-    # Must contain a core phrase
     if not has_core_phrase(text):
         return
 
-    # Minimal reject check — only obvious post-result or non-MLB context
     rejected, phrase = has_reject_phrase(text)
     if rejected:
         print(f"  🚫 @{handle}: '{phrase}' — {text[:60]}")
         return
 
-    # Extract BOTH player names — this is the golden rule
     pinch_hitter, replaced = extract_players(text)
 
-    # ── GOLDEN RULE: require both names ──────────────────────────────────────
     if not pinch_hitter or not replaced:
         print(f"  🚫 @{handle}: need both player names — ph={pinch_hitter} out={replaced}")
         return
 
-    # ── Both must be on MLB roster ────────────────────────────────────────────
     if not is_mlb_player(pinch_hitter) or not is_mlb_player(replaced):
         print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not on MLB roster")
         return
 
-    # Player cooldown
     if is_player_on_cooldown(pinch_hitter):
         print(f"  🔇 '{pinch_hitter}' on cooldown")
         return
 
-    # Determine team
     is_reporter = handle in REPORTER_HANDLES
     reporter    = REPORTER_BY_HANDLE.get(handle)
     team        = reporter["team"] if reporter else None
@@ -462,7 +449,7 @@ def handle_tweet(tid, text, handle):
     if not team:
         team = "Unknown Team"
 
-    url       = f"https://twitter.com/{handle}/status/{tid}"
+    url = f"https://twitter.com/{handle}/status/{tid}"
     if tid in posted_alert_keys:
         return
     posted_alert_keys.add(tid)
@@ -538,6 +525,11 @@ def connect_stream():
     print("[stream] Connecting...")
     r = requests.get(url, headers=TWITTER_HEADERS, params=params,
                      stream=True, timeout=30)
+    if r.status_code == 429:
+        print(f"[stream error] HTTP 429: {r.text[:200]}")
+        print("[stream] Too many connections — waiting 5 minutes before retry...")
+        time.sleep(300)  # wait 5 minutes, don't hammer Twitter
+        return
     if r.status_code != 200:
         print(f"[stream error] HTTP {r.status_code}: {r.text[:200]}")
         return
@@ -551,7 +543,7 @@ def run_stream():
     while True:
         try:
             for raw_line in connect_stream():
-                reconnect_wait = 5
+                reconnect_wait = 5  # reset on successful data
                 maybe_reset_daily()
                 build_player_team_map()
                 try:
@@ -573,7 +565,7 @@ def run_stream():
         except Exception as e:
             print(f"[stream] Error: {e} — reconnecting in {reconnect_wait}s...")
         time.sleep(reconnect_wait)
-        reconnect_wait = min(reconnect_wait * 2, 60)
+        reconnect_wait = min(reconnect_wait * 2, 300)  # cap at 5 minutes
 
 # ── REPORTER POLLER (background thread) ──────────────────────────────────────
 def get_user_ids_batch(handles):
