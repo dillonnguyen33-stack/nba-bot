@@ -3,13 +3,14 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
-from pinch_hit.alerts.discord import build_green_embed, delete_message, post_initial_alert, post_startup_ping
+from pinch_hit.alerts.discord import delete_message, post_initial_alert, post_startup_ping
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing import TweetResult
 from pinch_hit.parsing.tweet import (
@@ -64,6 +65,33 @@ def _headers() -> dict[str, str]:
     return {"x-api-key": os.environ.get("TWITTERAPI_IO_KEY", "")}
 
 
+def _is_rule_active(rule: dict[str, Any]) -> bool:
+    return rule.get("is_effect") in (1, True)
+
+
+async def _verify_rule_active(client: httpx.AsyncClient, headers: dict[str, str], rule_id: str) -> None:
+    r = await client.get(_GET_RULES_URL, headers=headers)
+    if r.status_code >= 400:
+        logger.error("get_rules verification failed: status=%s body=%s", r.status_code, r.text)
+    r.raise_for_status()
+
+    rules = r.json().get("rules", [])
+    rule = next(
+        (
+            candidate
+            for candidate in rules
+            if str(candidate.get("rule_id") or candidate.get("id") or "") == rule_id
+        ),
+        None,
+    )
+    if not rule:
+        raise ValueError(f"rule {rule_id} missing after activation")
+    if not _is_rule_active(rule):
+        raise ValueError(f"rule {rule_id} did not activate (is_effect={rule.get('is_effect')!r})")
+
+    logger.info("verified rule %s active with is_effect=%r", rule_id, rule.get("is_effect"))
+
+
 async def _register_rules(client: httpx.AsyncClient) -> None:
     headers = _headers()
 
@@ -89,7 +117,7 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         logger.exception("rule cleanup error")
 
     phrase_rule = " OR ".join(f'"{p}"' for p in PINCH_HIT_PHRASES)
-    rule_payload = {"value": phrase_rule, "tag": "phrases", "interval_seconds": 100}
+    rule_payload = {"value": phrase_rule, "tag": "phrases", "interval_seconds": 5}
 
     try:
         logger.info("adding rule: %s", rule_payload)
@@ -110,11 +138,33 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
         if activate_r.status_code >= 400:
             logger.error("update_rule failed: status=%s body=%s", activate_r.status_code, activate_r.text)
         activate_r.raise_for_status()
+        await _verify_rule_active(client, headers, str(rule_id))
         logger.info("activated rule %s (tag=phrases)", rule_id)
         logger.info("filter rules registered and activated: 1 rule")
     except (httpx.HTTPError, ValueError):
         logger.exception("rule registration failed")
         raise
+
+
+def _normalize_ws_tweet(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize flat WS payloads to nested format. No-ops for REST/test payloads."""
+    data = dict(raw)
+
+    if "screen_name" in data and "author" not in data:
+        author: dict[str, Any] = {"username": data.pop("screen_name")}
+        if "display_name" in data:
+            author["name"] = data.pop("display_name")
+        if "user_id" in data:
+            author["id"] = data.pop("user_id")
+        data["author"] = author
+
+    if "created_ms" in data and "created_at" not in data and "createdAt" not in data:
+        ms = data.pop("created_ms")
+        if isinstance(ms, (int, float)):
+            dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+            data["created_at"] = dt.isoformat()
+
+    return data
 
 
 def _get_nested_str(data: dict[str, Any], key: str, nested_key: str) -> str:
@@ -126,12 +176,9 @@ def _get_nested_str(data: dict[str, Any], key: str, nested_key: str) -> str:
 
 
 def _extract_reporter_handle(data: dict[str, Any]) -> str:
-    for handle in (
-        _get_nested_str(data, "author", "username"),
-        _get_nested_str(data, "user", "screen_name"),
-        _get_nested_str(data, "author", "userName"),
-        _get_nested_str(data, "author", "handle"),
-    ):
+    # After _normalize_ws_tweet, all payloads use nested author object.
+    for obj_key, field_key in (("author", "username"), ("author", "userName"), ("user", "screen_name")):
+        handle = _get_nested_str(data, obj_key, field_key)
         if handle:
             return handle
     return ""
@@ -140,10 +187,13 @@ def _extract_reporter_handle(data: dict[str, Any]) -> str:
 async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> None:
     logger.debug("raw tweet payload: %s", json.dumps(data, sort_keys=True, default=str))
 
-    tweet_id = str(data.get("id", ""))
+    raw_id = data.get("id")
+    tweet_id = str(raw_id) if raw_id else ""
     text = data.get("text", "")
     created_at = data.get("created_at") or data.get("createdAt")
     reporter_handle = _extract_reporter_handle(data)
+    if not created_at:
+        logger.warning("tweet %s has no timestamp field", tweet_id or "<missing id>")
 
     if not tweet_id or not text or not reporter_handle:
         logger.warning(
@@ -248,6 +298,39 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
     logger.info("alert fired: %s (%s)", result["pinch_hitter_raw"], result["team"])
 
 
+async def _handle_tweet_batch(event_type: str, msg: dict[str, Any], client: httpx.AsyncClient) -> None:
+    tweets = msg.get("tweets", [])
+
+    # fast_tweet may deliver a single tweet at the top level (no tweets[] array)
+    if not tweets and event_type == "fast_tweet" and "id" in msg and "text" in msg:
+        envelope_keys = {"event_type", "tweets", "rule_id", "rule_tag"}
+        tweet_data = {k: v for k, v in msg.items() if k not in envelope_keys}
+        tweets = [tweet_data]
+        logger.info("fast_tweet: extracted single tweet from top-level fields (id=%s)", msg.get("id"))
+    elif event_type == "fast_tweet":
+        other_fields = {key: value for key, value in msg.items() if key != "tweets"}
+        logger.info(
+            "fast_tweet payload received: tweets_count=%s other_fields=%s",
+            len(tweets) if isinstance(tweets, list) else "non-list",
+            other_fields,
+        )
+        logger.debug("fast_tweet tweets payload: %s", json.dumps(tweets, sort_keys=True, default=str))
+
+    if not isinstance(tweets, list):
+        logger.warning("%s event has non-list tweets payload: %r", event_type, tweets)
+        return
+
+    for tweet in tweets:
+        if not isinstance(tweet, dict):
+            logger.warning("%s event has non-dict tweet payload: %r", event_type, tweet)
+            continue
+        try:
+            normalized = _normalize_ws_tweet(tweet)
+            await _handle_message(normalized, client)
+        except Exception:
+            logger.exception("failed to process WS %s tweet id=%s", event_type, tweet.get("id", "?"))
+
+
 async def init_twitter() -> None:
     global _client
 
@@ -301,24 +384,13 @@ async def twitter_consumer() -> None:
                         logger.info("WebSocket handshake confirmed: %s", msg.get("message", ""))
                         runtime_state.last_twitter_message_at = time.time()
                         if not startup_pinged:
-                            await post_startup_ping(client)
-                            startup_pinged = True
+                            startup_pinged = await post_startup_ping(client)
 
                     elif event_type == "ping":
                         runtime_state.last_twitter_message_at = time.time()
 
-                    elif event_type == "tweet":
-                        tweets = msg.get("tweets", [])
-                        for tweet in tweets:
-                            if not isinstance(tweet, dict):
-                                continue
-                            try:
-                                await _handle_message(tweet, client)
-                            except Exception:
-                                logger.exception("failed to process WS tweet id=%s", tweet.get("id", "?"))
-
-                    elif event_type == "fast_tweet":
-                        logger.debug("fast_tweet event (stream-only); skipping")
+                    elif event_type in ("tweet", "fast_tweet"):
+                        await _handle_tweet_batch(event_type, msg, client)
 
                     else:
                         logger.debug("unhandled WS event_type=%s", event_type)

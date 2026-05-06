@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -36,6 +37,7 @@ def _load_env() -> None:
 _load_env()
 
 from pinch_hit.consumers.gumbo import schedule_poller  # noqa: E402
+from pinch_hit.consumers import twitter as twitter_mod  # noqa: E402
 from pinch_hit.consumers.twitter import close_twitter, init_twitter, twitter_consumer  # noqa: E402
 from pinch_hit.logging_config import configure_logging  # noqa: E402
 from pinch_hit.state.background import drain_background_tasks  # noqa: E402
@@ -70,7 +72,7 @@ def _build_response(status: str, body: bytes) -> bytes:
     return f"HTTP/1.0 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
 
 
-async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str]:
+async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, int]:
     # readuntil is implicitly capped at 64 KB by asyncio.StreamReader's buffer limit.
     headers_raw = await reader.readuntil(b"\r\n\r\n")
     header_text = headers_raw.decode("iso-8859-1")
@@ -82,7 +84,14 @@ async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str]:
 
     method, target, _version = parts
     path = target.split("?", 1)[0]
-    return method.upper(), path
+
+    content_length = 0
+    for line in lines[1:]:
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":", 1)[1].strip())
+            break
+
+    return method.upper(), path, content_length
 
 
 def _health_response() -> tuple[str, bytes]:
@@ -100,10 +109,49 @@ def _health_response() -> tuple[str, bytes]:
     return "503 Service Unavailable", b"unhealthy: twitter degraded"
 
 
+async def _handle_test_tweet(reader: asyncio.StreamReader, content_length: int) -> tuple[str, bytes]:
+    """Inject a fake tweet through the full pipeline (parsing → Discord)."""
+    if content_length <= 0 or content_length > 4096:
+        return "400 Bad Request", b"missing or oversized body"
+
+    try:
+        body = await asyncio.wait_for(reader.readexactly(content_length), timeout=_REQUEST_TIMEOUT)
+    except (TimeoutError, asyncio.IncompleteReadError):
+        return "400 Bad Request", b"body read failed"
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "400 Bad Request", b"invalid JSON"
+
+    if not isinstance(data, dict) or "text" not in data:
+        return "400 Bad Request", b'body must include "text" field'
+
+    client = twitter_mod._client
+    if client is None:
+        return "503 Service Unavailable", b"twitter client not initialized"
+
+    # Fill in defaults matching the WebSocket payload format
+    data.setdefault("id", f"test-{int(time.time() * 1000)}")
+    if "screen_name" not in data:
+        data["screen_name"] = data.pop("reporter_handle", "")
+    if "created_ms" not in data and "created_at" not in data and "createdAt" not in data:
+        data["created_ms"] = int(time.time() * 1000)
+
+    data = twitter_mod._normalize_ws_tweet(data)
+
+    try:
+        await twitter_mod._handle_message(data, client)
+    except Exception:
+        logger.exception("test-tweet handler error")
+        return "500 Internal Server Error", b"internal error"
+
+    return "200 OK", b"processed"
+
+
 async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         try:
-            method, path = await asyncio.wait_for(
+            method, path, content_length = await asyncio.wait_for(
                 _read_http_request(reader), timeout=_REQUEST_TIMEOUT
             )
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, UnicodeDecodeError, ValueError):
@@ -119,6 +167,8 @@ async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
         if method == "GET" and path == "/health":
             status, response_body = _health_response()
+        elif method == "POST" and path == "/test-tweet" and os.environ.get("ENABLE_TEST_ROUTES"):
+            status, response_body = await _handle_test_tweet(reader, content_length)
         else:
             status, response_body = "404 Not Found", b"not found"
 

@@ -13,10 +13,3 @@ class DiscordEmbed(TypedDict):
     description: NotRequired[str]
     fields: NotRequired[list[DiscordField]]
     footer: NotRequired[dict[str, str]]
-
-
-class OddsLine(TypedDict):
-    book: str
-    market: str
-    line: float
-    under_price: int
