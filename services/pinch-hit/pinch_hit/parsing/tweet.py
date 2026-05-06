@@ -34,6 +34,51 @@ last_roster_refresh: float = 0.0
 _refresh_lock = asyncio.Lock()
 
 
+# ── PAST-TENSE DETECTION ──────────────────────────────────────────────────────
+# Philosophy: only reject what CANNOT be a pre-event alert.
+# "pinched" = substitution already made (past tense of the sub itself)
+# Result words = at-bat already completed
+# Inning references = reporter writing recap, not preview
+# Everything else (has left, was sent up, came up, came off bench) = keep,
+# because reporter could be describing something happening right now.
+
+_PAST_TENSE_SIGNALS = [
+    # The sub itself in past tense — only truly reliable signal
+    "pinched",
+    # At-bat result words — can only appear after the at-bat completed
+    "homered",
+    "singled",
+    "doubled",
+    "tripled",
+    "grounded out",
+    "flied out",
+    "lined out",
+    "struck out",
+    "popped out",
+    "drove in",
+    "drove home",
+    # Inning references — reporters don't preview pinch hits with inning numbers
+    "in the 1st", "in the 2nd", "in the 3rd", "in the 4th",
+    "in the 5th", "in the 6th", "in the 7th", "in the 8th", "in the 9th",
+    "in the 10th", "in the 11th", "in the 12th",
+]
+
+
+def is_past_tense(text: str) -> tuple[bool, str]:
+    """
+    Returns (True, matched_phrase) if the tweet describes a pinch hit
+    that has already happened. Returns (False, "") otherwise.
+    Intentionally minimal — only rejects what cannot be a pre-event alert.
+    """
+    tl = text.lower()
+    for signal in _PAST_TENSE_SIGNALS:
+        if signal in tl:
+            return True, signal
+    return False, ""
+
+
+# ── ROSTER LOOKUP ─────────────────────────────────────────────────────────────
+
 async def _fetch_team_roster(
     client: httpx.AsyncClient, team_name: str, team_id: int
 ) -> dict[str, str]:
@@ -73,7 +118,6 @@ async def build_player_team_map() -> None:
             empty_count += 1
         new_map.update(entries)
     if not new_map and player_team_map:
-        # Total API failure — keep stale roster data instead of wiping it
         logger.critical("all %s teams returned empty; keeping stale roster", empty_count)
         return
     player_team_map = new_map
@@ -214,6 +258,15 @@ async def process_tweet(
     tl = text.lower()
     if not any(phrase in tl for phrase in PINCH_HIT_PHRASES):
         return {**base, "reject_reason": "no pinch-hit phrase"}
+
+    # ── PAST-TENSE CHECK — filter already-happened pinch hits ────────────────
+    past, matched_signal = is_past_tense(text)
+    if past:
+        logger.info(
+            "tweet %s rejected: past-tense signal %r — %s",
+            tweet_id, matched_signal, text[:100],
+        )
+        return {**base, "reject_reason": f"past-tense: {matched_signal}"}
 
     hitter_raw, replaced = extract_players(text)
     if not hitter_raw:
