@@ -1,8 +1,9 @@
 """
-MLB Pinch Hit Alert Bot - v6
-Golden rule: require BOTH player names, both on MLB roster.
-No more reject phrase whack-a-mole.
-Simple, clean, accurate.
+MLB Pinch Hit Alert Bot - v7
+Key change: replaced static roster check with live daily lineup check.
+Instead of checking 40-man roster, we check actual players in today's games.
+This solves the callup problem — if they're in the lineup they're in the system.
+Golden rule still applies: both player names required, both in today's lineups.
 """
 
 import os
@@ -20,6 +21,7 @@ ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
 ET_TZ                = pytz.timezone("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
+LINEUP_REFRESH_SECS  = 300   # refresh lineups every 5 minutes
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -116,7 +118,6 @@ TEAM_ALIASES = {
     "giants": "Giants", "san francisco": "Giants",
 }
 
-# ── CORE PHRASES — tweet must contain one of these ───────────────────────────
 CORE_PHRASES = [
     "pinch hit for",
     "pinch-hit for",
@@ -127,7 +128,6 @@ CORE_PHRASES = [
     "pinch-hitting for",
 ]
 
-# ── MINIMAL REJECT PHRASES — only clear post-result language ─────────────────
 REJECT_PHRASES = [
     "home run", "homered",
     "singled", "doubled", "tripled",
@@ -140,7 +140,6 @@ REJECT_PHRASES = [
     "softball", "little league",
 ]
 
-# ── ODDS API ──────────────────────────────────────────────────────────────────
 PROP_BOOKS = {
     "draftkings":  "DraftKings",
     "fanduel":     "FanDuel",
@@ -150,15 +149,6 @@ PROP_BOOKS = {
 }
 
 MLB_PROP_MARKETS = ["batter_hits", "batter_total_bases", "batter_rbis", "batter_home_runs"]
-
-MLB_TEAM_IDS = {
-    "Orioles": 110, "Red Sox": 111, "Yankees": 147, "Rays": 139, "Blue Jays": 141,
-    "White Sox": 145, "Guardians": 114, "Tigers": 116, "Royals": 118, "Twins": 142,
-    "Astros": 117, "Angels": 108, "Athletics": 133, "Mariners": 136, "Rangers": 140,
-    "Braves": 144, "Marlins": 146, "Mets": 121, "Phillies": 143, "Nationals": 120,
-    "Cubs": 112, "Reds": 113, "Brewers": 158, "Pirates": 134, "Cardinals": 138,
-    "Diamondbacks": 109, "Rockies": 115, "Dodgers": 119, "Padres": 135, "Giants": 137,
-}
 
 STREAM_RULES = [
     {"value": '"pinch hit for" -is:retweet lang:en',        "tag": "pinch_hit_for"},
@@ -172,10 +162,12 @@ STREAM_RULES = [
 seen_tweet_ids      = set()
 posted_alert_keys   = set()
 last_reset_date     = None
-player_team_map     = {}
-last_roster_refresh = 0
 player_alert_count  = {}
 player_alert_time   = {}
+
+# Daily lineup cache — {full_name_lower: team_name}
+daily_lineup_map    = {}
+last_lineup_refresh = 0
 
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
@@ -189,18 +181,20 @@ def is_game_hours():
 
 def maybe_reset_daily():
     global seen_tweet_ids, last_reset_date, posted_alert_keys
-    global player_alert_count, player_alert_time
+    global player_alert_count, player_alert_time, daily_lineup_map, last_lineup_refresh
     today = datetime.now(ET_TZ).date()
     if last_reset_date is None:
         last_reset_date = today
         return
     if today > last_reset_date:
-        print("[reset] New day — clearing state")
-        seen_tweet_ids     = set()
-        posted_alert_keys  = set()
-        player_alert_count = {}
-        player_alert_time  = {}
-        last_reset_date    = today
+        print("[reset] New day — clearing all state")
+        seen_tweet_ids      = set()
+        posted_alert_keys   = set()
+        player_alert_count  = {}
+        player_alert_time   = {}
+        daily_lineup_map    = {}
+        last_lineup_refresh = 0
+        last_reset_date     = today
 
 # ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
 def is_player_on_cooldown(name):
@@ -220,47 +214,126 @@ def record_player_alert(name):
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
 
-# ── ROSTER LOOKUP ─────────────────────────────────────────────────────────────
-def build_player_team_map():
-    global player_team_map, last_roster_refresh
+# ── DAILY LINEUP CHECK — replaces static roster ───────────────────────────────
+def build_daily_lineup_map():
+    """
+    Pulls every player from today's MLB games (scheduled, pre-game, live).
+    Includes starting lineups AND bench players.
+    Refreshes every 5 minutes so callups appear quickly.
+    """
+    global daily_lineup_map, last_lineup_refresh
     now = time.time()
-    if now - last_roster_refresh < 21600 and player_team_map:
+    if now - last_lineup_refresh < LINEUP_REFRESH_SECS and daily_lineup_map:
         return
-    print("[roster] Refreshing MLB roster...")
+
+    print("[lineup] Refreshing today's MLB lineups...")
     new_map = {}
-    for team_name, team_id in MLB_TEAM_IDS.items():
+
+    try:
+        # Get today's schedule
+        today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+        sched = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": today_str, "gameType": "R",
+                    "hydrate": "roster,lineups"},
+            timeout=10
+        )
+        sched.raise_for_status()
+        game_pks = [
+            g["gamePk"]
+            for d in sched.json().get("dates", [])
+            for g in d.get("games", [])
+        ]
+    except Exception as e:
+        print(f"[lineup] Schedule error: {e}")
+        return
+
+    for game_pk in game_pks:
         try:
             r = requests.get(
-                f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
-                params={"rosterType": "active"}, timeout=10
+                f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+                timeout=10
             )
             r.raise_for_status()
-            for player in r.json().get("roster", []):
-                full_name = player.get("person", {}).get("fullName", "")
-                if not full_name:
-                    continue
-                parts    = full_name.split()
-                full_low = full_name.lower()
-                new_map[full_low] = team_name
-                if len(parts) >= 2:
-                    new_map[parts[0].lower() + " " + parts[-1].lower()] = team_name
+            data     = r.json()
+            boxscore = data.get("liveData", {}).get("boxscore", {})
+
+            for side in ["home", "away"]:
+                team_data   = boxscore.get("teams", {}).get(side, {})
+                team_info   = team_data.get("team", {})
+                team_name   = team_info.get("name", "")
+                # Map team name to our alias
+                team_mapped = None
+                for alias, mapped in TEAM_ALIASES.items():
+                    if alias in team_name.lower():
+                        team_mapped = mapped
+                        break
+
+                players = team_data.get("players", {})
+                for pid, pdata in players.items():
+                    full_name = pdata.get("person", {}).get("fullName", "")
+                    if not full_name:
+                        continue
+                    parts    = full_name.split()
+                    full_low = full_name.lower()
+                    new_map[full_low] = team_mapped or team_name
+                    if len(parts) >= 2:
+                        # first + last
+                        new_map[parts[0].lower() + " " + parts[-1].lower()] = team_mapped or team_name
+                        # last name only — stored separately for fuzzy fallback
+                        new_map["_last_" + parts[-1].lower()] = team_mapped or team_name
+
             time.sleep(0.2)
         except Exception as e:
-            print(f"[roster error] {team_name}: {e}")
-    player_team_map     = new_map
-    last_roster_refresh = now
-    print(f"[roster] {len(new_map)} entries loaded\n")
+            print(f"[lineup] Game {game_pk} error: {e}")
 
-def is_mlb_player(name):
-    if not name or not player_team_map:
+    daily_lineup_map    = new_map
+    last_lineup_refresh = now
+    print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded from today's games\n")
+
+def is_todays_player(name):
+    """
+    Check if player is in today's MLB games.
+    First tries full name match, then first+last, then last name only as fallback.
+    Last name only requires the name has at least 2 parts (first + last).
+    """
+    if not name or not daily_lineup_map:
         return False
-    nl = name.lower().strip()
-    return nl in player_team_map and " " in nl
+
+    nl    = name.lower().strip()
+    parts = nl.split()
+
+    # Full name match
+    if nl in daily_lineup_map and " " in nl:
+        return True
+
+    # First + last match (handles middle names)
+    if len(parts) >= 2:
+        first_last = parts[0] + " " + parts[-1]
+        if first_last in daily_lineup_map:
+            return True
+
+    # Last name fallback — only if last name is 5+ chars (avoids common short names)
+    if len(parts) >= 2 and len(parts[-1]) >= 5:
+        last_key = "_last_" + parts[-1]
+        if last_key in daily_lineup_map:
+            return True
+
+    return False
 
 def lookup_player_team(name):
-    if not name or not player_team_map:
+    if not name or not daily_lineup_map:
         return None
-    return player_team_map.get(name.lower().strip())
+    nl    = name.lower().strip()
+    parts = nl.split()
+
+    if nl in daily_lineup_map:
+        return daily_lineup_map[nl]
+    if len(parts) >= 2:
+        first_last = parts[0] + " " + parts[-1]
+        if first_last in daily_lineup_map:
+            return daily_lineup_map[first_last]
+    return None
 
 def infer_team_from_text(text):
     tl = text.lower()
@@ -270,8 +343,8 @@ def infer_team_from_text(text):
     words = text.split()
     for i in range(len(words) - 1):
         two = (words[i] + " " + words[i+1]).lower()
-        if two in player_team_map:
-            return player_team_map[two]
+        if two in daily_lineup_map:
+            return daily_lineup_map[two]
     return None
 
 # ── DETECTION ─────────────────────────────────────────────────────────────────
@@ -297,9 +370,8 @@ def extract_players(text):
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+ph(?:ing)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+).*?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:has\s+)?left\s+the\s+game[^.]*?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:has\s+)?left\s+the\s+game[^.]*?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch',
     ]
     for p in patterns_both:
         m = re.search(p, clean)
@@ -427,12 +499,18 @@ def handle_tweet(tid, text, handle):
 
     pinch_hitter, replaced = extract_players(text)
 
+    # Golden rule — require both names
     if not pinch_hitter or not replaced:
-        print(f"  🚫 @{handle}: need both player names — ph={pinch_hitter} out={replaced}")
+        print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
         return
 
-    if not is_mlb_player(pinch_hitter) or not is_mlb_player(replaced):
-        print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not on MLB roster")
+    # Check both players are in today's actual MLB games
+    build_daily_lineup_map()
+    ph_in_lineup  = is_todays_player(pinch_hitter)
+    rep_in_lineup = is_todays_player(replaced)
+
+    if not ph_in_lineup or not rep_in_lineup:
+        print(f"  🚫 @{handle}: '{pinch_hitter}'({ph_in_lineup}) or '{replaced}'({rep_in_lineup}) not in today's lineups")
         return
 
     if is_player_on_cooldown(pinch_hitter):
@@ -526,9 +604,8 @@ def connect_stream():
     r = requests.get(url, headers=TWITTER_HEADERS, params=params,
                      stream=True, timeout=30)
     if r.status_code == 429:
-        print(f"[stream error] HTTP 429: {r.text[:200]}")
-        print("[stream] Too many connections — waiting 5 minutes before retry...")
-        time.sleep(300)  # wait 5 minutes, don't hammer Twitter
+        print(f"[stream] 429 rate limit — waiting 5 min...")
+        time.sleep(300)
         return
     if r.status_code != 200:
         print(f"[stream error] HTTP {r.status_code}: {r.text[:200]}")
@@ -543,9 +620,9 @@ def run_stream():
     while True:
         try:
             for raw_line in connect_stream():
-                reconnect_wait = 5  # reset on successful data
+                reconnect_wait = 5
                 maybe_reset_daily()
-                build_player_team_map()
+                build_daily_lineup_map()
                 try:
                     data = json.loads(raw_line)
                 except:
@@ -565,7 +642,7 @@ def run_stream():
         except Exception as e:
             print(f"[stream] Error: {e} — reconnecting in {reconnect_wait}s...")
         time.sleep(reconnect_wait)
-        reconnect_wait = min(reconnect_wait * 2, 300)  # cap at 5 minutes
+        reconnect_wait = min(reconnect_wait * 2, 300)
 
 # ── REPORTER POLLER (background thread) ──────────────────────────────────────
 def get_user_ids_batch(handles):
@@ -614,9 +691,10 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v6 — Golden Rule Edition")
-    print("   GOLDEN RULE: both player names required, both on MLB roster")
-    print("   Minimal reject phrases — roster check does the heavy lifting")
+    print("⚾ MLB Pinch Hit Bot v7 — Daily Lineup Edition")
+    print("   Checks TODAY'S actual MLB game lineups instead of static roster")
+    print("   Refreshes lineups every 5 minutes — callups appear instantly")
+    print("   Golden rule: both names required, both in today's games")
     print("   Real-time filtered stream + reporter background poller")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
@@ -627,7 +705,7 @@ def run():
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
 
-    build_player_team_map()
+    build_daily_lineup_map()
 
     print("Looking up reporter user IDs...")
     handles  = [r["handle"] for r in REPORTERS]
