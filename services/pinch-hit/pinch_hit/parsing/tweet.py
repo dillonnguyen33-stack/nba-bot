@@ -9,6 +9,7 @@ from typing import Literal, TypedDict
 import httpx
 
 from pinch_hit.config import REPORTERS, Reporter
+from pinch_hit.parsing.llm import PlayerPair, extract_players_llm
 from pinch_hit.parsing.names import normalize_last_name
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,9 @@ PINCH_HIT_PHRASES = {"pinch hit", "pinch-hit", "ph for", "pinch hitting", "pinch
 
 REPORTER_BY_HANDLE: dict[str, Reporter] = {r["handle"].lower(): r for r in REPORTERS}
 
-player_team_map: dict[str, str] = {}
+PlayerTeamMap = dict[str, str]
+
+player_team_map: PlayerTeamMap = {}
 last_roster_refresh: float = 0.0
 _refresh_lock = asyncio.Lock()
 
@@ -65,8 +68,8 @@ def has_reject_signal(text: str) -> tuple[bool, str]:
 
 async def _fetch_team_roster(
     client: httpx.AsyncClient, team_name: str, team_id: int
-) -> dict[str, str]:
-    entries: dict[str, str] = {}
+) -> PlayerTeamMap:
+    entries: PlayerTeamMap = {}
     try:
         r = await client.get(
             f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
@@ -95,7 +98,7 @@ async def build_player_team_map() -> None:
             _fetch_team_roster(client, name, tid)
             for name, tid in MLB_TEAM_IDS.items()
         ])
-    new_map: dict[str, str] = {}
+    new_map: PlayerTeamMap = {}
     empty_count = 0
     for entries in results:
         if not entries:
@@ -162,11 +165,11 @@ def strip_mentions(text: str) -> str:
     return re.sub(r'@\w+', '', text)
 
 
-def extract_players(text: str) -> tuple[str | None, str | None]:
+def extract_players(text: str) -> PlayerPair:
     clean = strip_mentions(text)
 
     patterns_both = [
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:(?:in|going|coming|set)\s+to\s+|(?:on\s+deck\s+to\s+))?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+taking\s+over\s+\w+\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -188,7 +191,7 @@ def extract_players(text: str) -> tuple[str | None, str | None]:
             return m.group(2).strip(), m.group(1).strip()
 
     patterns_hitter_only = [
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\b',
+        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:(?:is|will)\s+)?(?:(?:in|going|coming|set)\s+to\s+|(?:on\s+deck\s+to\s+))?pinch[- ]hit(?:ting)?\b',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\b',
         r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit|ph)\b',
         r'[Pp]inch[- ][Hh]it(?:ting)?[,;:\s.—–\-]+(?:(?:is|will\s+be)\s+)?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
@@ -202,7 +205,7 @@ def extract_players(text: str) -> tuple[str | None, str | None]:
     # Only match when at least one name is extractable.
     _NAME = r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)'
     mixed_patterns = [
-        rf'{_NAME}\s+(?:(?:is|will)\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+{_NAME}',
+        rf'{_NAME}\s+(?:(?:is|will)\s+)?(?:(?:in|going|coming|set)\s+to\s+|(?:on\s+deck\s+to\s+))?pinch[- ]hit(?:ting)?\s+for\s+{_NAME}',
         rf'{_NAME}\s+(?:will\s+)?(?:bat|hit|ph(?:ing)?)\s+for\s+{_NAME}',
     ]
     for p in mixed_patterns:
@@ -275,7 +278,9 @@ async def process_tweet(
 
     hitter_raw, replaced = extract_players(text)
     if not hitter_raw:
-        return {**base, "reject_reason": "no player name extracted"}
+        hitter_raw, replaced = await extract_players_llm(text)
+        if not hitter_raw:
+            return {**base, "reject_reason": "no player name extracted"}
 
     # Try direct roster lookup on both names
     hitter_team = lookup_player_team(hitter_raw)

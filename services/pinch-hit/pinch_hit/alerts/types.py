@@ -7,10 +7,14 @@ class DiscordField(TypedDict):
     inline: bool
 
 
+class DiscordFooter(TypedDict):
+    text: str
+
+
 class DiscordEmbed(TypedDict):
     title: str
     color: int
     description: NotRequired[str]
     fields: NotRequired[list[DiscordField]]
-    footer: NotRequired[dict[str, str]]
+    footer: NotRequired[DiscordFooter]
     timestamp: NotRequired[str]

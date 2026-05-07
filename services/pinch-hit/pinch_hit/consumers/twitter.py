@@ -78,10 +78,11 @@ _GET_RULES_URL = "https://api.twitterapi.io/oapi/tweet_filter/get_rules"
 _DELETE_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/delete_rule"
 
 _client: httpx.AsyncClient | None = None
+_api_key: str = ""
 
 
 def _headers() -> dict[str, str]:
-    return {"x-api-key": os.environ.get("TWITTERAPI_IO_KEY", "")}
+    return {"x-api-key": _api_key}
 
 
 def _is_rule_active(rule: dict[str, Any]) -> bool:
@@ -371,8 +372,9 @@ async def _handle_tweet_batch(event_type: str, msg: dict[str, Any], client: http
 
 
 async def init_twitter() -> None:
-    global _client
+    global _client, _api_key
 
+    _api_key = os.environ.get("TWITTERAPI_IO_KEY", "")
     await refresh_if_stale()
 
     client = httpx.AsyncClient(timeout=15)
@@ -402,8 +404,7 @@ async def twitter_consumer() -> None:
     if client is None:
         raise RuntimeError("twitter client is not initialized")
 
-    api_key = os.environ.get("TWITTERAPI_IO_KEY", "")
-    extra_headers = {"x-api-key": api_key}
+    extra_headers = {"x-api-key": _api_key}
     startup_pinged = False
 
     while True:

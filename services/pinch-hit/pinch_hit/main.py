@@ -36,6 +36,7 @@ def _load_env() -> None:
 
 _load_env()
 
+from pinch_hit.parsing.llm import close_llm_client  # noqa: E402
 from pinch_hit.consumers.gumbo import schedule_poller  # noqa: E402
 from pinch_hit.consumers import twitter as twitter_mod  # noqa: E402
 from pinch_hit.consumers.twitter import close_twitter, init_twitter, twitter_consumer  # noqa: E402
@@ -255,6 +256,7 @@ async def main() -> None:
             logger.info("cancelled; draining in-flight background tasks")
             await drain_background_tasks(timeout=5.0)
     finally:
+        await close_llm_client()
         await close_twitter()
         await close_db()
         logger.info("shutdown complete")

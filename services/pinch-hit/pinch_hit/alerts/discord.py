@@ -7,7 +7,7 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -276,12 +276,12 @@ _MAX_RETRY_SLEEP = 30.0
 
 async def _request_with_retries(
     client: httpx.AsyncClient,
-    method: str,
+    method: Literal["GET", "POST", "PATCH", "DELETE"],
     url: str,
-    **kwargs: Any,
+    json: dict[str, Any] | None = None,
 ) -> httpx.Response:
     for attempt in range(1, _DISCORD_RETRIES + 1):
-        response = await client.request(method, url, **kwargs)
+        response = await client.request(method, url, json=json)
 
         is_rate_limited = response.status_code == 429
         is_server_error = response.status_code >= 500

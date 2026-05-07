@@ -7,7 +7,7 @@ import time
 import sqlite3
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discordapp.com/api/webhooks/1486803328766574753/lVrHREVTqTkWiKl0rL1LKx8RuGZkJdD3IE1ZXXZ1YQi9z77IEzIeesP_GKLLn5r1lxgo")
 POLL_INTERVAL_SECONDS = 10
 DB_PATH = os.environ.get("DB_PATH", "corrections.db")
@@ -48,7 +48,6 @@ def init_db():
     print(f"[db] Database ready: {DB_PATH}")
 
 def already_reported(correction_key):
-    """Check if this correction was already posted (survives restarts)."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT 1 FROM corrections WHERE correction_key = ?", (correction_key,))
@@ -59,10 +58,6 @@ def already_reported(correction_key):
 def save_correction(game_id, play_id, player, stat, old_val, new_val,
                     description, period, clock, detected_at, seconds_to_correct,
                     correction_key):
-    """
-    Save correction to database FIRST before posting to Discord.
-    Returns True if saved successfully, False if already exists.
-    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -184,7 +179,7 @@ def post_to_discord(game, play, old_play, correction_type, label, stat,
                 f"⏱ corrected {time_str} after recorded"
             ),
             "color": COLORS.get(correction_type, 0xAAAAAA),
-            "footer": {"text": f"NBA Correction Bot · {datetime.utcnow().strftime('%H:%M UTC')}"}
+            "footer": {"text": f"NBA Correction Bot · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}
         }]
     }
 
@@ -236,7 +231,6 @@ def run():
                 for (stat, old_v, new_v) in diffs:
                     correction_key = f"{game_id}_{pid}_{stat}_{old_v}_{new_v}"
 
-                    # Check database first
                     if already_reported(correction_key):
                         continue
 
@@ -253,7 +247,7 @@ def run():
                         new_play.get("description", ""),
                         new_play.get("period", 0),
                         new_play.get("clock", ""),
-                        datetime.utcnow().isoformat(),
+                        datetime.now(timezone.utc).isoformat(),
                         elapsed,
                         correction_key
                     )
