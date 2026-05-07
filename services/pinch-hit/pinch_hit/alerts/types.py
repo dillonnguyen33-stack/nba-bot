@@ -13,3 +13,4 @@ class DiscordEmbed(TypedDict):
     description: NotRequired[str]
     fields: NotRequired[list[DiscordField]]
     footer: NotRequired[dict[str, str]]
+    timestamp: NotRequired[str]

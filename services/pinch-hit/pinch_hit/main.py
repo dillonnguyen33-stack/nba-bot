@@ -50,7 +50,7 @@ from pinch_hit.workers.timeout import timeout_watcher  # noqa: E402
 configure_logging()
 logger = logging.getLogger(__name__)
 
-_main_task: asyncio.Future[Any] | None = None
+_main_task: asyncio.Task[None] | None = None
 
 
 async def _supervise(coro_fn: "Callable[[], Coroutine[Any, Any, None]]", name: str) -> None:
@@ -223,7 +223,7 @@ async def main() -> None:
     global _main_task
 
     # Fail fast on missing required env vars
-    for var in ("TWITTERAPI_IO_KEY", "PINCH_HIT_WEBHOOK_URL"):
+    for var in ("TWITTERAPI_IO_KEY", "PINCH_HIT_WEBHOOK_URL", "OFFICIAL_PLAYS_WEBHOOK_URL"):
         if not os.environ.get(var):
             raise RuntimeError(f"{var} must be set")
 

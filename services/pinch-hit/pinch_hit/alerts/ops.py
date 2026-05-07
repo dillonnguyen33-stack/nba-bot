@@ -7,6 +7,8 @@ from pinch_hit.alerts.discord import _ensure_client
 
 logger = logging.getLogger(__name__)
 
+# Log the missing-URL warning once instead of on every call — ops alerts fire
+# frequently during normal operation and would spam the logs otherwise.
 _warned_no_url = False
 
 
