@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,7 +18,6 @@ from pinch_hit.parsing.tweet import (
     PINCH_HIT_PHRASES,
     REPORTER_BY_HANDLE,
     process_tweet,
-    refresh_if_stale,
 )
 from pinch_hit.state.repository import insert_pending_alert, is_tweet_seen, try_claim_tweet
 from pinch_hit.state.runtime import runtime_state
@@ -27,30 +27,9 @@ logger = logging.getLogger(__name__)
 _WS_URL = "wss://ws.twitterapi.io/twitter/tweet/websocket"
 _WS_RECONNECT_DELAY = 90.0
 
-_PLAYER_COOLDOWN_SEC = 7200
-_PLAYER_MAX_ALERTS = 2
-_player_alert_count: dict[str, int] = {}
-_player_alert_time: dict[str, float] = {}
-
-
-def _is_player_on_cooldown(name: str) -> bool:
-    if not name:
-        return False
-    key = name.lower().strip()
-    now = time.time()
-    if key in _player_alert_time and now - _player_alert_time[key] > _PLAYER_COOLDOWN_SEC:
-        del _player_alert_count[key]
-        del _player_alert_time[key]
-        return False
-    return _player_alert_count.get(key, 0) >= _PLAYER_MAX_ALERTS
-
-
-def _record_player_alert(name: str) -> None:
-    if not name:
-        return
-    key = name.lower().strip()
-    _player_alert_count[key] = _player_alert_count.get(key, 0) + 1
-    _player_alert_time[key] = time.time()
+_SEEN_CACHE_MAX = 500
+_seen_tweet_ids: set[str] = set()
+_seen_tweet_order: deque[str] = deque()
 
 
 _ADD_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/add_rule"
@@ -185,15 +164,17 @@ def _extract_reporter_handle(data: dict[str, Any]) -> str:
 
 
 async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> None:
-    logger.debug("raw tweet payload: %s", json.dumps(data, sort_keys=True, default=str))
-
     raw_id = data.get("id")
     tweet_id = str(raw_id) if raw_id else ""
+
+    if tweet_id and tweet_id in _seen_tweet_ids:
+        logger.info("skipping duplicate tweet %s (in-memory cache)", tweet_id)
+        return
+
+    logger.debug("raw tweet payload: %s", json.dumps(data, sort_keys=True, default=str))
+
     text = data.get("text", "")
-    created_at = data.get("created_at") or data.get("createdAt")
     reporter_handle = _extract_reporter_handle(data)
-    if not created_at:
-        logger.warning("tweet %s has no timestamp field", tweet_id or "<missing id>")
 
     if not tweet_id or not text or not reporter_handle:
         logger.warning(
@@ -206,18 +187,20 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
 
     runtime_state.last_twitter_message_at = time.time()
 
+    _seen_tweet_ids.add(tweet_id)
+    _seen_tweet_order.append(tweet_id)
+    if len(_seen_tweet_order) > _SEEN_CACHE_MAX:
+        _seen_tweet_ids.discard(_seen_tweet_order.popleft())
+
     log_event(
         "tweet_received",
         source="twitter",
         raw_payload={"tweet_id": tweet_id, "text": text, "reporter_handle": reporter_handle},
     )
 
-    await refresh_if_stale()
-
     result: TweetResult = await process_tweet(
         tweet_id=tweet_id,
         text=text,
-        created_at=created_at,
         reporter_handle=reporter_handle,
         is_seen_fn=is_tweet_seen,
     )
@@ -229,12 +212,6 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
             raw_payload={"tweet_id": tweet_id, "reason": result["reject_reason"], "text": text},
         )
         return
-
-    key_player = result["pinch_hitter_raw"]
-    if _is_player_on_cooldown(key_player):
-        logger.info("player %s on cooldown; skipping", key_player)
-        return
-    _record_player_alert(key_player)
 
     reporter_info = REPORTER_BY_HANDLE.get(reporter_handle.lower())
     reporter_display = reporter_info["handle"] if reporter_info else reporter_handle
@@ -333,8 +310,6 @@ async def _handle_tweet_batch(event_type: str, msg: dict[str, Any], client: http
 
 async def init_twitter() -> None:
     global _client
-
-    await refresh_if_stale()
 
     client = httpx.AsyncClient(timeout=15)
     try:
