@@ -8,6 +8,10 @@ from pinch_hit.types import AlertStatus, STATUS_CONFIRMED, STATUS_PENDING, STATU
 logger = logging.getLogger(__name__)
 
 
+def _rows_to_alerts(rows: list) -> list[PendingAlertRow]:
+    return [cast(PendingAlertRow, dict(row)) for row in rows]
+
+
 async def insert_pending_alert(
     discord_message_id: str,
     pinch_hitter_raw: str,
@@ -39,7 +43,7 @@ async def get_pending_alerts_by_team(team_id: int) -> list[PendingAlertRow]:
         (STATUS_PENDING, team_id),
     ) as cursor:
         rows = await cursor.fetchall()
-    return [cast(PendingAlertRow, dict(row)) for row in rows]
+    return _rows_to_alerts(rows)
 
 
 async def update_alert_status(alert_id: int, status: AlertStatus, game_pk: int | None = None) -> None:
@@ -66,7 +70,7 @@ async def get_expired_pending_alerts(timeout_minutes: int) -> list[PendingAlertR
         (STATUS_PENDING, f"-{timeout_minutes}"),
     ) as cursor:
         rows = await cursor.fetchall()
-    return [cast(PendingAlertRow, dict(row)) for row in rows]
+    return _rows_to_alerts(rows)
 
 
 async def bulk_update_alerts_timeout(alert_ids: list[int]) -> None:

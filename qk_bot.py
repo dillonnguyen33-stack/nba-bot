@@ -9,7 +9,7 @@ import os
 import re
 import requests
 import discord
-from datetime import datetime
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY")
@@ -52,15 +52,9 @@ STAT_MAP = {
 STAT_SHORT = {"assists": "AST", "points": "PTS", "rebounds": "REB"}
 STAT_EMOJI = {"assists": "🎯", "points": "🏀", "rebounds": "💪"}
 def fuzzy_score(a, b):
-    """Return similarity ratio between two strings (0.0 to 1.0)."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 def best_fuzzy_match(query, candidates):
-    """
-    Find the best fuzzy match for query among candidates.
-    candidates: list of dicts with 'name', 'first', 'last', 'full'
-    Returns (best_candidate, score) or (None, 0) if no good match.
-    """
     query = query.lower().strip()
     best_score = 0
     best_match = None
@@ -180,10 +174,6 @@ def get_boxscore(game_id):
         return {}
 
 def find_player_stats(player_raw, stat_type):
-    """
-    Fuzzy match player_raw against all players in live games.
-    Returns player data dict if exactly one confident match, else None.
-    """
     games = get_live_games()
     if not games:
         print(f"[debug] No live games found")
@@ -316,7 +306,8 @@ def get_all_book_odds(player_name, stat_type, line):
                 },
                 timeout=10
             ).json()
-        except:
+        except Exception as e:
+            print(f"[odds event error] {e}")
             continue
 
         for bookmaker in data.get("bookmakers", []):
@@ -433,7 +424,7 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
         f"{ev_line if adj_prob else ''}"
         f"{lines_section}"
         f"{kelly_section}\n"
-        f"-# QK Bot · {datetime.utcnow().strftime('%H:%M UTC')}"
+        f"-# QK Bot · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
 intents = discord.Intents.default()
 intents.message_content = True

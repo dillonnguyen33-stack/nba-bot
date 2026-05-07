@@ -1,9 +1,4 @@
-"""
-MLB Pinch Hit Alert Bot - v6
-Golden rule: require BOTH player names, both on MLB roster.
-No more reject phrase whack-a-mole.
-Simple, clean, accurate.
-"""
+"""MLB Pinch Hit Alert Bot — polls Twitter for pre-event pinch hit alerts and posts to Discord."""
 
 import os
 import re
@@ -11,13 +6,13 @@ import time
 import json
 import requests
 from datetime import datetime, timezone
-import pytz
+from zoneinfo import ZoneInfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
-ET_TZ                = pytz.timezone("America/New_York")
+ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
 
@@ -224,7 +219,7 @@ def record_player_alert(name):
 def build_player_team_map():
     global player_team_map, last_roster_refresh
     now = time.time()
-    if now - last_roster_refresh < 21600 and player_team_map:
+    if now - last_roster_refresh < 900 and player_team_map:  # 15min — catch in-game roster moves
         return
     print("[roster] Refreshing MLB roster...")
     new_map = {}
@@ -318,7 +313,8 @@ def get_player_lines(player_name):
             "https://api.the-odds-api.com/v4/sports/baseball_mlb/events",
             params={"apiKey": ODDS_API_KEY}, timeout=10
         ).json()
-    except:
+    except Exception as e:
+        print(f"[odds error] {e}")
         return {}
     for event in events[:6]:
         event_id = event.get("id")
@@ -331,7 +327,8 @@ def get_player_lines(player_name):
                             "oddsFormat": "american", "regions": "us,us2"},
                     timeout=10
                 ).json()
-            except:
+            except Exception as e:
+                print(f"[odds error] {e}")
                 continue
             for bk in r.get("bookmakers", []):
                 bname = PROP_BOOKS.get(bk.get("key", ""))
@@ -548,7 +545,8 @@ def run_stream():
                 build_player_team_map()
                 try:
                     data = json.loads(raw_line)
-                except:
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    print(f"[stream error] unparseable payload: {raw_line[:100]}")
                     continue
                 tweet_data = data.get("data", {})
                 users      = {u["id"]: u["username"].lower()
@@ -592,7 +590,8 @@ def get_user_tweets(user_id, max_results=3):
         )
         r.raise_for_status()
         return r.json().get("data", [])
-    except:
+    except Exception as e:
+        print(f"[user tweets error] {e}")
         return []
 
 def poll_reporters_forever(user_ids):
@@ -614,10 +613,8 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v6 — Golden Rule Edition")
-    print("   GOLDEN RULE: both player names required, both on MLB roster")
-    print("   Minimal reject phrases — roster check does the heavy lifting")
-    print("   Real-time filtered stream + reporter background poller")
+    print("MLB Pinch Hit Bot starting")
+    print(f"   Real-time filtered stream + reporter background poller")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:

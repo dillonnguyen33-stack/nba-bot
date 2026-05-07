@@ -14,6 +14,12 @@ dependencies = [
     "websockets>=14",
 ]
 
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pinch_hit*"]
