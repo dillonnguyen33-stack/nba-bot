@@ -11,13 +11,13 @@ import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
-from pinch_hit.alerts.discord import delete_message, post_initial_alert, post_startup_ping
+from pinch_hit.alerts.discord import delete_message, post_initial_alert, post_startup_ping, post_unfiltered_alert
 from pinch_hit.eval.logger import log_event
 from pinch_hit.parsing import TweetResult
 from pinch_hit.parsing.tweet import (
     PINCH_HIT_PHRASES,
-    REPORTER_BY_HANDLE,
     process_tweet,
+    refresh_if_stale,
 )
 from pinch_hit.state.repository import insert_pending_alert, is_tweet_seen, try_claim_tweet
 from pinch_hit.state.runtime import runtime_state
@@ -27,9 +27,49 @@ logger = logging.getLogger(__name__)
 _WS_URL = "wss://ws.twitterapi.io/twitter/tweet/websocket"
 _WS_RECONNECT_DELAY = 90.0
 
+_PLAYER_COOLDOWN_SEC = 7200
+_PLAYER_MAX_ALERTS = 2
+_player_alert_count: dict[str, int] = {}
+_player_alert_time: dict[str, float] = {}
+_last_cooldown_sweep: float = 0.0
+
 _SEEN_CACHE_MAX = 500
 _seen_tweet_ids: set[str] = set()
 _seen_tweet_order: deque[str] = deque()
+
+
+def _sweep_expired_cooldowns() -> None:
+    global _last_cooldown_sweep
+    now = time.time()
+    if now - _last_cooldown_sweep < _PLAYER_COOLDOWN_SEC:
+        return
+    expired = [k for k, t in _player_alert_time.items() if now - t > _PLAYER_COOLDOWN_SEC]
+    for k in expired:
+        _player_alert_count.pop(k, None)
+        _player_alert_time.pop(k, None)
+    _last_cooldown_sweep = now
+
+
+def _is_player_on_cooldown(name: str) -> bool:
+    if not name:
+        return False
+    _sweep_expired_cooldowns()
+    key = name.lower().strip()
+    now = time.time()
+    if key in _player_alert_time and now - _player_alert_time[key] > _PLAYER_COOLDOWN_SEC:
+        _player_alert_count.pop(key, None)
+        _player_alert_time.pop(key, None)
+        return False
+    return _player_alert_count.get(key, 0) >= _PLAYER_MAX_ALERTS
+
+
+def _record_player_alert(name: str) -> None:
+    if not name:
+        return
+    key = name.lower().strip()
+    _player_alert_count[key] = _player_alert_count.get(key, 0) + 1
+    if key not in _player_alert_time:
+        _player_alert_time[key] = time.time()
 
 
 _ADD_RULE_URL = "https://api.twitterapi.io/oapi/tweet_filter/add_rule"
@@ -74,6 +114,7 @@ async def _verify_rule_active(client: httpx.AsyncClient, headers: dict[str, str]
 async def _register_rules(client: httpx.AsyncClient) -> None:
     headers = _headers()
 
+    cleanup_failed = False
     try:
         r = await client.get(_GET_RULES_URL, headers=headers)
         r.raise_for_status()
@@ -92,8 +133,13 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
             logger.error("auth failure during rule cleanup — API key may be invalid: %s", e)
             raise
         logger.error("rule cleanup failed (non-auth): %s", e)
+        cleanup_failed = True
     except (httpx.HTTPError, ValueError):
         logger.exception("rule cleanup error")
+        cleanup_failed = True
+
+    if cleanup_failed:
+        logger.warning("stale filter rules may remain active; adding new rule on top")
 
     phrase_rule = " OR ".join(f'"{p}"' for p in PINCH_HIT_PHRASES)
     rule_payload = {"value": phrase_rule, "tag": "phrases", "interval_seconds": 5}
@@ -174,7 +220,10 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
     logger.debug("raw tweet payload: %s", json.dumps(data, sort_keys=True, default=str))
 
     text = data.get("text", "")
+    created_at = data.get("created_at") or data.get("createdAt")
     reporter_handle = _extract_reporter_handle(data)
+    if not created_at:
+        logger.warning("tweet %s has no timestamp field", tweet_id or "<missing id>")
 
     if not tweet_id or not text or not reporter_handle:
         logger.warning(
@@ -198,9 +247,17 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         raw_payload={"tweet_id": tweet_id, "text": text, "reporter_handle": reporter_handle},
     )
 
+    # Debug visibility: fire every phrase match before filtering so operators can audit rejections
+    tl = text.lower()
+    if any(phrase in tl for phrase in PINCH_HIT_PHRASES):
+        await post_unfiltered_alert(tweet_text=text, reporter_handle=reporter_handle, client=client)
+
+    await refresh_if_stale()
+
     result: TweetResult = await process_tweet(
         tweet_id=tweet_id,
         text=text,
+        created_at=created_at,
         reporter_handle=reporter_handle,
         is_seen_fn=is_tweet_seen,
     )
@@ -213,8 +270,11 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         )
         return
 
-    reporter_info = REPORTER_BY_HANDLE.get(reporter_handle.lower())
-    reporter_display = reporter_info["handle"] if reporter_info else reporter_handle
+    key_player = result["pinch_hitter_raw"]
+    if _is_player_on_cooldown(key_player):
+        logger.info("player %s on cooldown; skipping", key_player)
+        return
+    _record_player_alert(key_player)
 
     log_event(
         "tweet_parsed",
@@ -228,7 +288,9 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         pinch_hitter=result["pinch_hitter_raw"],
         team=result["team"],
         tweet_text=text,
-        reporter=reporter_display,
+        reporter_handle=reporter_handle,
+        tweet_id=tweet_id,
+        replaced_player=result["replaced_player"],
         client=client,
     )
 
@@ -310,6 +372,8 @@ async def _handle_tweet_batch(event_type: str, msg: dict[str, Any], client: http
 
 async def init_twitter() -> None:
     global _client
+
+    await refresh_if_stale()
 
     client = httpx.AsyncClient(timeout=15)
     try:

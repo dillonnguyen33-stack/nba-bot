@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, cast
 
 import httpx
@@ -16,12 +18,25 @@ logger = logging.getLogger(__name__)
 COLOR_GREEN = 3066993   # 0x2ecc71
 COLOR_RED = 15158332    # 0xe74c3c
 COLOR_GREY = 9807270    # 0x95a5a6
-COLOR_BLUE = 3447003    # 0x3498db
 _DISCORD_RETRIES = 3
+
+_DISCORD_MD_CHARS = re.compile(r'([*_~|>\[\]()\\])')
+
+
+def _escape_md(text: str) -> str:
+    return _DISCORD_MD_CHARS.sub(r'\\\1', text)
+
+
+def _get_webhook_url(env_var: str) -> str:
+    return os.environ.get(env_var, "")
 
 
 def _webhook_url() -> str:
-    return os.environ.get("PINCH_HIT_WEBHOOK_URL", "")
+    return _get_webhook_url("PINCH_HIT_WEBHOOK_URL")
+
+
+def _official_webhook_url() -> str:
+    return _get_webhook_url("OFFICIAL_PLAYS_WEBHOOK_URL")
 
 
 @asynccontextmanager
@@ -37,18 +52,38 @@ def build_green_embed(
     pinch_hitter: str,
     team: str,
     tweet_text: str,
-    reporter: str,
+    reporter_handle: str,
+    tweet_id: str = "",
+    replaced_player: str | None = None,
 ) -> DiscordEmbed:
-    fields: list[DiscordField] = [
-        {"name": "Player", "value": pinch_hitter, "inline": True},
-        {"name": "Team", "value": team, "inline": True},
-        {"name": "Reporter", "value": reporter, "inline": True},
-    ]
+    tweet_url = f"https://x.com/{reporter_handle}/status/{tweet_id}" if tweet_id and reporter_handle else ""
+
+    safe_hitter = _escape_md(pinch_hitter)
+    safe_text = _escape_md(tweet_text)
+    safe_handle = _escape_md(reporter_handle)
+
+    if replaced_player:
+        player_line = f"**{safe_hitter}** will pinch hit for **{_escape_md(replaced_player)}**"
+    else:
+        player_line = f"**{safe_hitter}** is being called to pinch hit"
+
+    quote = f"@{safe_handle}:\n*{safe_text}*"
+    if tweet_url:
+        quote += f"\n[View Tweet]({tweet_url})"
+
+    description = (
+        f"Twitter source — pre-event pinch hit\n\n"
+        f"{player_line}\n\n"
+        f"{quote}\n\n"
+        f"Lines: not found on tracked books"
+    )
+
     return {
-        "title": "⚾🚨 PINCH HIT ALERT — BET THE UNDER NOW",
-        "description": tweet_text,
+        "title": f"Pinch Hit Alert — {team}",
+        "description": description,
         "color": COLOR_GREEN,
-        "fields": fields,
+        "footer": {"text": "General Alert"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -57,8 +92,8 @@ def build_confirmed_embed(base_embed: DiscordEmbed, gumbo_player_name: str) -> D
     return {
         **base_embed,
         "color": COLOR_RED,
-        "title": "CONFIRMED BY MLB -- EDGE GONE",
-        "fields": [confirmed_field, *base_embed.get("fields", [])],
+        "title": "FIXED",
+        "fields": [confirmed_field],
     }
 
 
@@ -66,22 +101,13 @@ def build_timeout_embed(base_embed: DiscordEmbed) -> DiscordEmbed:
     return {
         **base_embed,
         "color": COLOR_GREY,
-        "title": "~~UNCONFIRMED~~",
+        "title": "UNCONFIRMED",
     }
 
-
-def build_blue_embed(pinch_hitter: str, team: str) -> DiscordEmbed:
-    return {
-        "title": "DIRECT FROM MLB -- NO EDGE",
-        "color": COLOR_BLUE,
-        "fields": [
-            {"name": "Player", "value": pinch_hitter, "inline": True},
-            {"name": "Team", "value": team, "inline": True},
-        ],
-    }
 
 
 async def post_startup_ping(client: httpx.AsyncClient | None = None) -> bool:
+    # Goes to the debug channel so operators see the bot is alive without cluttering alerts
     url = _webhook_url()
     if not url:
         logger.error("PINCH_HIT_WEBHOOK_URL not set")
@@ -104,19 +130,50 @@ async def post_startup_ping(client: httpx.AsyncClient | None = None) -> bool:
         return False
 
 
+async def post_unfiltered_alert(
+    tweet_text: str,
+    reporter_handle: str,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    url = _webhook_url()
+    if not url:
+        logger.debug("PINCH_HIT_WEBHOOK_URL not set; skipping unfiltered alert")
+        return
+
+    embed: DiscordEmbed = {
+        "title": "Unfiltered Tweet",
+        "description": tweet_text,
+        "color": COLOR_GREY,
+        "fields": [{"name": "Reporter", "value": f"@{reporter_handle}", "inline": True}],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    payload = {"embeds": [embed]}
+
+    try:
+        async with _ensure_client(client) as c:
+            await _request_with_retries(c, "POST", url, json=payload)
+    except (httpx.HTTPError, ValueError):
+        logger.exception("post_unfiltered_alert failed")
+
+
 async def post_initial_alert(
     pinch_hitter: str,
     team: str,
     tweet_text: str,
-    reporter: str = "",
+    reporter_handle: str = "",
+    tweet_id: str = "",
+    replaced_player: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> str | None:
-    url = _webhook_url()
+    url = _official_webhook_url()
     if not url:
-        logger.error("PINCH_HIT_WEBHOOK_URL not set")
+        logger.error("OFFICIAL_PLAYS_WEBHOOK_URL not set")
         return None
 
-    embed = build_green_embed(pinch_hitter, team, tweet_text, reporter)
+    embed = build_green_embed(
+        pinch_hitter, team, tweet_text, reporter_handle,
+        tweet_id=tweet_id, replaced_player=replaced_player,
+    )
     payload = {"content": "@everyone", "embeds": [embed]}
 
     try:
@@ -139,9 +196,9 @@ async def patch_embed(
     embed: DiscordEmbed,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
-    url = _webhook_url()
+    url = _official_webhook_url()
     if not url:
-        logger.error("PINCH_HIT_WEBHOOK_URL not set")
+        logger.error("OFFICIAL_PLAYS_WEBHOOK_URL not set")
         return False
 
     payload = {"embeds": [embed]}
@@ -159,9 +216,9 @@ async def delete_message(
     message_id: str,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
-    url = _webhook_url()
+    url = _official_webhook_url()
     if not url:
-        logger.error("PINCH_HIT_WEBHOOK_URL not set")
+        logger.error("OFFICIAL_PLAYS_WEBHOOK_URL not set")
         return False
 
     try:
@@ -188,40 +245,20 @@ async def _patch(client: httpx.AsyncClient, url: str, message_id: str, payload: 
 async def fetch_current_embed(
     message_id: str, client: httpx.AsyncClient | None = None,
 ) -> DiscordEmbed | None:
-    url = _webhook_url()
+    url = _official_webhook_url()
     if not url:
-        logger.error("PINCH_HIT_WEBHOOK_URL not set")
+        logger.error("OFFICIAL_PLAYS_WEBHOOK_URL not set")
         return None
     try:
         async with _ensure_client(client) as c:
             r = await _request_with_retries(c, "GET", f"{url}/messages/{message_id}")
-            return cast(DiscordEmbed, r.json()["embeds"][0])
-    except (httpx.HTTPError, ValueError, IndexError, KeyError):
+            embeds = r.json().get("embeds", [])
+            if not embeds:
+                return None
+            return cast(DiscordEmbed, embeds[0])
+    except (httpx.HTTPError, ValueError):
         logger.exception("fetch embed failed message_id=%s", message_id)
         return None
-
-
-async def post_blue_alert(
-    pinch_hitter: str,
-    team: str,
-    client: httpx.AsyncClient | None = None,
-) -> bool:
-    url = _webhook_url()
-    if not url:
-        logger.error("PINCH_HIT_WEBHOOK_URL not set")
-        return False
-
-    embed = build_blue_embed(pinch_hitter, team)
-    payload = {"embeds": [embed]}
-
-    try:
-        async with _ensure_client(client) as c:
-            await _request_with_retries(c, "POST", url, json=payload)
-        logger.info("posted blue alert for %s", pinch_hitter)
-        return True
-    except (httpx.HTTPError, ValueError):
-        logger.exception("post_blue_alert failed")
-        return False
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:

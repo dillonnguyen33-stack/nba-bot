@@ -13,7 +13,6 @@ from pinch_hit.alerts.discord import (
     build_green_embed,
     fetch_current_embed,
     patch_embed,
-    post_blue_alert,
 )
 from pinch_hit.alerts.ops import post_ops_alert
 from pinch_hit.eval.logger import log_event
@@ -81,7 +80,6 @@ async def _handle_substitution(
     gumbo_pinch_hitter, gumbo_replaced = result
     is_top = play.get("about", {}).get("isTopInning", False)
     batting_team_id = away_team_id if is_top else home_team_id
-    batting_team_name = away_team_name if is_top else home_team_name
     log_event(
         "mlb_substitution",
         source="gumbo",
@@ -104,13 +102,16 @@ async def _handle_substitution(
         try:
             await update_alert_status(matched["id"], STATUS_CONFIRMED, game_pk=game_pk)
         except Exception:
-            # Discord shows CONFIRMED but DB still says pending — timeout watcher
-            # may later turn it grey.
+            # Discord PATCH succeeded but DB write failed — these aren't in a single
+            # transaction, so the timeout watcher may later overwrite the embed to grey.
             logger.critical("DB update failed AFTER Discord PATCH for alert %s", matched["id"], exc_info=True)
-            await post_ops_alert(
-                f"CRITICAL: Alert {matched['id']} shows CONFIRMED on Discord but DB update failed. May revert to UNCONFIRMED on timeout.",
-                client,
-            )
+            try:
+                await post_ops_alert(
+                    f"CRITICAL: Alert {matched['id']} shows CONFIRMED on Discord but DB update failed. May revert to UNCONFIRMED on timeout.",
+                    client,
+                )
+            except Exception:
+                logger.exception("ops alert also failed for alert %s", matched["id"])
             return
         log_event(
             "alert_confirmed",
@@ -121,34 +122,6 @@ async def _handle_substitution(
             raw_payload={"replaced": gumbo_replaced, "alert_id": matched["id"]},
         )
         logger.info("confirmed: %s game=%s", gumbo_pinch_hitter, game_pk)
-    elif runtime_state.twitter_degraded:
-        try:
-            posted = await post_blue_alert(gumbo_pinch_hitter, batting_team_name, client)
-            if posted:
-                log_event(
-                    "fallback_alert",
-                    source="gumbo",
-                    game_pk=game_pk,
-                    pinch_hitter=gumbo_pinch_hitter,
-                    team_id=batting_team_id,
-                    raw_payload={"replaced": gumbo_replaced},
-                )
-                logger.info("fallback blue alert: %s game=%s", gumbo_pinch_hitter, game_pk)
-            else:
-                logger.critical(
-                    "FALLBACK ALERT FAILED: %s game=%s — user received NO alert",
-                    gumbo_pinch_hitter, game_pk,
-                )
-                await post_ops_alert(
-                    f"CRITICAL: Fallback alert failed for {gumbo_pinch_hitter} game {game_pk}. User received no alert.",
-                    client,
-                )
-        except Exception:
-            logger.critical("FALLBACK ALERT EXCEPTION: %s game=%s — user received NO alert", gumbo_pinch_hitter, game_pk, exc_info=True)
-            await post_ops_alert(
-                f"CRITICAL: Fallback alert exception for {gumbo_pinch_hitter} game {game_pk}. User received no alert.",
-                client,
-            )
     else:
         log_event(
             "unmatched_substitution",
@@ -253,8 +226,11 @@ async def _fetch_qualifying_games(client: httpx.AsyncClient) -> list[QualifyingG
                 continue
             home = g.get("teams", {}).get("home", {})
             away = g.get("teams", {}).get("away", {})
+            game_pk = g.get("gamePk")
+            if not game_pk:
+                continue
             results.append({
-                "game_pk": g["gamePk"],
+                "game_pk": game_pk,
                 "home_team_id": home.get("team", {}).get("id", 0),
                 "away_team_id": away.get("team", {}).get("id", 0),
                 "home_team_name": home.get("team", {}).get("name", ""),
@@ -338,7 +314,8 @@ async def schedule_poller() -> None:
                             _game_pool[game_pk] = task
                             logger.info("spawned subscriber for game %s inning=%s", game_pk, inning)
 
-                    # Prune completed tasks that didn't self-remove (e.g. exception exit)
+                    # _poll_game removes itself on normal exit, but an unhandled exception
+                    # skips that cleanup — sweep here to avoid leaking done tasks.
                     done_pks = [gp for gp, task in list(_game_pool.items()) if task.done()]
                     for gp in done_pks:
                         _game_pool.pop(gp, None)

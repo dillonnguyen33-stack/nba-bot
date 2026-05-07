@@ -9,7 +9,6 @@ STATUS_TIMEOUT: AlertStatus = "timeout"
 EventType = Literal[
     "alert_fired",
     "alert_confirmed",
-    "fallback_alert",
     "mlb_substitution",
     "tweet_parsed",
     "tweet_received",
