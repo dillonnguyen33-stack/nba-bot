@@ -35,7 +35,6 @@ def log_event(
     team_id: int | None = None,
     raw_payload: dict[str, Any] | None = None,
 ) -> None:
-    """Fire-and-forget — caller never awaits the write."""
     payload_str = json.dumps(raw_payload) if raw_payload is not None else None
     schedule_background(
         _write_row(event_type, source, game_pk, pinch_hitter, team_id, payload_str),

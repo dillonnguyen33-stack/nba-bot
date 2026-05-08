@@ -36,8 +36,12 @@ async def get_db() -> aiosqlite.Connection:
 async def close_db() -> None:
     global _db
     if _db:
-        await _db.close()
-        _db = None
+        try:
+            await _db.close()
+        except Exception:
+            logger.exception("error closing database")
+        finally:
+            _db = None
 
 
 async def _apply_migrations(db: aiosqlite.Connection) -> None:

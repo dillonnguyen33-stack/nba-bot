@@ -3,12 +3,11 @@ import os
 
 import httpx
 
-from pinch_hit.alerts.discord import _ensure_client
+from pinch_hit.alerts.discord import ensure_client
 
 logger = logging.getLogger(__name__)
 
-# Log the missing-URL warning once instead of on every call — ops alerts fire
-# frequently during normal operation and would spam the logs otherwise.
+# Warn once — ops alerts are frequent during normal operation
 _warned_no_url = False
 
 
@@ -21,7 +20,7 @@ async def post_ops_alert(message: str, client: httpx.AsyncClient | None = None) 
             _warned_no_url = True
         return
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             r = await c.post(url, json={"content": message})
             r.raise_for_status()
     except (httpx.HTTPError, ValueError):

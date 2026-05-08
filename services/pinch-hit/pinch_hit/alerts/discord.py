@@ -40,7 +40,7 @@ def _official_webhook_url() -> str:
 
 
 @asynccontextmanager
-async def _ensure_client(client: httpx.AsyncClient | None) -> AsyncIterator[httpx.AsyncClient]:
+async def ensure_client(client: httpx.AsyncClient | None) -> AsyncIterator[httpx.AsyncClient]:
     if client is None:
         async with httpx.AsyncClient(timeout=10) as c:
             yield c
@@ -121,7 +121,7 @@ async def post_startup_ping(client: httpx.AsyncClient | None = None) -> bool:
     payload = {"embeds": [embed]}
 
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             await _request_with_retries(c, "POST", url, json=payload)
         logger.info("startup ping sent")
         return True
@@ -150,7 +150,7 @@ async def post_unfiltered_alert(
     payload = {"embeds": [embed]}
 
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             await _request_with_retries(c, "POST", url, json=payload)
     except (httpx.HTTPError, ValueError):
         logger.exception("post_unfiltered_alert failed")
@@ -177,7 +177,7 @@ async def post_initial_alert(
     payload = {"content": "@everyone", "embeds": [embed]}
 
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             return await _post_wait(c, url, payload)
     except (httpx.HTTPError, ValueError):
         logger.exception("post_initial_alert failed")
@@ -204,7 +204,7 @@ async def patch_embed(
     payload = {"embeds": [embed]}
 
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             await _patch(c, url, message_id, payload)
         return True
     except (httpx.HTTPError, ValueError):
@@ -222,7 +222,7 @@ async def delete_message(
         return False
 
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             await _request_with_retries(c, "DELETE", f"{url}/messages/{message_id}")
         logger.info("deleted message %s", message_id)
         return True
@@ -250,7 +250,7 @@ async def fetch_current_embed(
         logger.error("OFFICIAL_PLAYS_WEBHOOK_URL not set")
         return None
     try:
-        async with _ensure_client(client) as c:
+        async with ensure_client(client) as c:
             r = await _request_with_retries(c, "GET", f"{url}/messages/{message_id}")
             embeds = r.json().get("embeds", [])
             if not embeds:
