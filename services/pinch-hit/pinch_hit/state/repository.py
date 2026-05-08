@@ -1,6 +1,8 @@
 import logging
 from typing import cast
 
+import aiosqlite
+
 from pinch_hit.state.db import get_db
 from pinch_hit.state.types import PendingAlertRow
 from pinch_hit.types import AlertStatus, STATUS_CONFIRMED, STATUS_PENDING, STATUS_TIMEOUT
@@ -8,38 +10,61 @@ from pinch_hit.types import AlertStatus, STATUS_CONFIRMED, STATUS_PENDING, STATU
 logger = logging.getLogger(__name__)
 
 
-def _rows_to_alerts(rows: list) -> list[PendingAlertRow]:
+def _rows_to_alerts(rows: list[aiosqlite.Row]) -> list[PendingAlertRow]:
     return [cast(PendingAlertRow, dict(row)) for row in rows]
 
 
-async def insert_pending_alert(
-    discord_message_id: str,
+async def insert_provisional_alert(
     pinch_hitter_raw: str,
     pinch_hitter_normalized: str,
     team_id: int,
     tweet_id: str,
     replaced_player: str | None = None,
-    game_pk: int | None = None,
 ) -> int:
     db = await get_db()
     cursor = await db.execute(
         """INSERT INTO pending_alerts
            (discord_message_id, pinch_hitter_raw, pinch_hitter_normalized,
             replaced_player, team_id, game_pk, tweet_id, posted_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)""",
-        (discord_message_id, pinch_hitter_raw, pinch_hitter_normalized,
-         replaced_player, team_id, game_pk, tweet_id, STATUS_PENDING),
+           VALUES ('', ?, ?, ?, ?, NULL, ?, datetime('now'), ?)""",
+        (pinch_hitter_raw, pinch_hitter_normalized,
+         replaced_player, team_id, tweet_id, STATUS_PENDING),
     )
     await db.commit()
     if cursor.lastrowid is None:
-        raise RuntimeError("insert_pending_alert: no row ID returned")
+        raise RuntimeError("insert_provisional_alert: no row ID returned")
     return cursor.lastrowid
+
+
+async def update_alert_message_id(alert_id: int, discord_message_id: str) -> None:
+    db = await get_db()
+    await db.execute(
+        "UPDATE pending_alerts SET discord_message_id = ? WHERE id = ?",
+        (discord_message_id, alert_id),
+    )
+    await db.commit()
+
+
+async def delete_alert(alert_id: int) -> None:
+    db = await get_db()
+    await db.execute("DELETE FROM pending_alerts WHERE id = ?", (alert_id,))
+    await db.commit()
+
+
+async def cleanup_provisional_alerts() -> int:
+    # Crash recovery: a previous run may have inserted a row before posting to Discord
+    db = await get_db()
+    cursor = await db.execute(
+        "DELETE FROM pending_alerts WHERE discord_message_id = ''"
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def get_pending_alerts_by_team(team_id: int) -> list[PendingAlertRow]:
     db = await get_db()
     async with db.execute(
-        "SELECT * FROM pending_alerts WHERE status = ? AND team_id = ?",
+        "SELECT * FROM pending_alerts WHERE status = ? AND team_id = ? AND discord_message_id != ''",
         (STATUS_PENDING, team_id),
     ) as cursor:
         rows = await cursor.fetchall()
@@ -66,6 +91,7 @@ async def get_expired_pending_alerts(timeout_minutes: int) -> list[PendingAlertR
     async with db.execute(
         """SELECT * FROM pending_alerts
            WHERE status = ?
+           AND discord_message_id != ''
            AND posted_at < datetime('now', ? || ' minutes')""",
         (STATUS_PENDING, f"-{timeout_minutes}"),
     ) as cursor:
@@ -86,7 +112,6 @@ async def bulk_update_alerts_timeout(alert_ids: list[int]) -> None:
 
 
 async def try_claim_tweet(tweet_id: str) -> bool:
-    """Atomically claim a tweet_id. Returns True if this caller won the race."""
     db = await get_db()
     cursor = await db.execute(
         "INSERT OR IGNORE INTO seen_tweets (tweet_id) VALUES (?)",

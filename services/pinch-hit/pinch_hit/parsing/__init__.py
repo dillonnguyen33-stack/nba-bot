@@ -1,3 +1,5 @@
-from pinch_hit.parsing.tweet import TweetResult
+PlayerPair = tuple[str | None, str | None]
 
-__all__ = ["TweetResult"]
+from pinch_hit.parsing.tweet import TweetResult  # noqa: E402 — after PlayerPair to avoid circular import
+
+__all__ = ["PlayerPair", "TweetResult"]

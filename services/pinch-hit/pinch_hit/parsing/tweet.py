@@ -9,7 +9,8 @@ from typing import Literal, TypedDict
 import httpx
 
 from pinch_hit.config import REPORTERS, Reporter
-from pinch_hit.parsing.llm import PlayerPair, extract_players_llm
+from pinch_hit.parsing import PlayerPair
+from pinch_hit.parsing.llm import extract_players_llm
 from pinch_hit.parsing.names import normalize_last_name
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ MLB_TEAM_IDS: dict[str, int] = {
 PINCH_HIT_PHRASES = {"pinch hit", "pinch-hit", "ph for", "pinch hitting", "pinch-hitting"}
 
 REPORTER_BY_HANDLE: dict[str, Reporter] = {r["handle"].lower(): r for r in REPORTERS}
+
+_MAX_EMPTY_ROSTER_TEAMS = 10
+ROSTER_STALE_SECONDS = 21600  # 6 hours
 
 PlayerTeamMap = dict[str, str]
 
@@ -50,7 +54,10 @@ _REJECT_SIGNALS = [
     "popped out",
     "drove in",
     "drove home",
-    "home run",
+    "home run", "homer",
+    "rbi",
+    "walk-off", "walkoff",
+    "grand slam",
     "last night", "yesterday",
     "college", "university", "high school", "ncaa",
     "minor league", "minors", "triple-a", "double-a",
@@ -69,25 +76,31 @@ def has_reject_signal(text: str) -> tuple[bool, str]:
 async def _fetch_team_roster(
     client: httpx.AsyncClient, team_name: str, team_id: int
 ) -> PlayerTeamMap:
-    entries: PlayerTeamMap = {}
-    try:
-        r = await client.get(
-            f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
-            params={"rosterType": "active"},
-        )
-        r.raise_for_status()
-        for player in r.json().get("roster", []):
-            full_name = player.get("person", {}).get("fullName", "")
-            if not full_name:
-                continue
-            parts = full_name.split()
-            full_low = full_name.lower()
-            entries[full_low] = team_name
-            if len(parts) >= 2:
-                entries[parts[0].lower() + " " + parts[-1].lower()] = team_name
-    except (httpx.HTTPError, ValueError):
-        logger.exception("roster fetch failed team=%s", team_name)
-    return entries
+    for attempt in range(2):
+        entries: PlayerTeamMap = {}
+        try:
+            r = await client.get(
+                f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster",
+                params={"rosterType": "active"},
+            )
+            r.raise_for_status()
+            for player in r.json().get("roster", []):
+                full_name = player.get("person", {}).get("fullName", "")
+                if not full_name:
+                    continue
+                parts = full_name.split()
+                full_low = full_name.lower()
+                entries[full_low] = team_name
+                if len(parts) >= 2:
+                    entries[parts[0].lower() + " " + parts[-1].lower()] = team_name
+            return entries
+        except (httpx.HTTPError, ValueError):
+            if attempt == 0:
+                logger.warning("roster fetch attempt 1 failed team=%s; retrying in 2s", team_name)
+                await asyncio.sleep(2)
+            else:
+                logger.exception("roster fetch failed team=%s after retry", team_name)
+    return {}
 
 
 async def build_player_team_map() -> None:
@@ -107,17 +120,21 @@ async def build_player_team_map() -> None:
     if not new_map and player_team_map:
         logger.critical("all %s teams returned empty; keeping stale roster", empty_count)
         return
+    if empty_count > _MAX_EMPTY_ROSTER_TEAMS:
+        logger.warning(
+            "%s/%s teams returned empty; keeping stale roster to avoid partial data",
+            empty_count, len(MLB_TEAM_IDS),
+        )
+        return
     player_team_map = new_map
     last_roster_refresh = time.time()
-    if empty_count > 5:
-        logger.warning("%s/%s teams returned empty rosters; possible API issue", empty_count, len(MLB_TEAM_IDS))
     logger.info("%s roster entries loaded", len(new_map))
 
 
 async def refresh_if_stale() -> None:
-    if time.time() - last_roster_refresh >= 21600 or not player_team_map:
+    if time.time() - last_roster_refresh >= ROSTER_STALE_SECONDS or not player_team_map:
         async with _refresh_lock:
-            if time.time() - last_roster_refresh >= 21600 or not player_team_map:
+            if time.time() - last_roster_refresh >= ROSTER_STALE_SECONDS or not player_team_map:
                 await build_player_team_map()
 
 
@@ -153,8 +170,7 @@ def is_recent(created_at_str: str) -> bool:
         try:
             tweet_time = datetime.strptime(created_at_str, _TWITTER_DATE_FMT)
         except ValueError:
-            # Fail-open: unparseable timestamps pass through so we don't silently
-            # drop legitimate alerts due to an unexpected date format.
+            # Fail-open: unknown date formats pass rather than reject legitimate alerts
             logger.warning("unparseable created_at=%s; treating as recent", created_at_str)
             return True
     age = (datetime.now(timezone.utc) - tweet_time).total_seconds()
@@ -201,8 +217,7 @@ def extract_players(text: str) -> PlayerPair:
         if m:
             return m.group(1).strip(), None
 
-    # Last-name-only fallback: one or both names may be a single capitalized word.
-    # Only match when at least one name is extractable.
+    # Fallback: match single-word last names (e.g. "Osuna PH for Foscue")
     _NAME = r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)'
     mixed_patterns = [
         rf'{_NAME}\s+(?:(?:is|will)\s+)?(?:(?:in|going|coming|set)\s+to\s+|(?:on\s+deck\s+to\s+))?pinch[- ]hit(?:ting)?\s+for\s+{_NAME}',
@@ -244,10 +259,6 @@ async def process_tweet(
     reporter_handle: str,
     is_seen_fn: Callable[[str], Awaitable[bool]],
 ) -> TweetResult:
-    """
-    Full parsing pipeline. Returns TweetResult with passed=True on success.
-    Caller logs tweet_rejected / alert_fired based on result.
-    """
     base: TweetRejected = {
         "passed": False,
         "tweet_id": tweet_id,

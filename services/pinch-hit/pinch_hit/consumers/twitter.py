@@ -19,7 +19,14 @@ from pinch_hit.parsing.tweet import (
     process_tweet,
     refresh_if_stale,
 )
-from pinch_hit.state.repository import insert_pending_alert, is_tweet_seen, try_claim_tweet
+from pinch_hit.state.background import schedule_background
+from pinch_hit.state.repository import (
+    delete_alert,
+    insert_provisional_alert,
+    is_tweet_seen,
+    try_claim_tweet,
+    update_alert_message_id,
+)
 from pinch_hit.state.runtime import runtime_state
 
 logger = logging.getLogger(__name__)
@@ -38,10 +45,13 @@ _seen_tweet_ids: set[str] = set()
 _seen_tweet_order: deque[str] = deque()
 
 
-def _sweep_expired_cooldowns() -> None:
+_COOLDOWN_CAP = 500
+
+
+def _sweep_expired_cooldowns(*, force: bool = False) -> None:
     global _last_cooldown_sweep
     now = time.time()
-    if now - _last_cooldown_sweep < _PLAYER_COOLDOWN_SEC:
+    if not force and now - _last_cooldown_sweep < _PLAYER_COOLDOWN_SEC:
         return
     expired = [k for k, t in _player_alert_time.items() if now - t > _PLAYER_COOLDOWN_SEC]
     for k in expired:
@@ -55,17 +65,14 @@ def _is_player_on_cooldown(name: str) -> bool:
         return False
     _sweep_expired_cooldowns()
     key = name.lower().strip()
-    now = time.time()
-    if key in _player_alert_time and now - _player_alert_time[key] > _PLAYER_COOLDOWN_SEC:
-        _player_alert_count.pop(key, None)
-        _player_alert_time.pop(key, None)
-        return False
     return _player_alert_count.get(key, 0) >= _PLAYER_MAX_ALERTS
 
 
 def _record_player_alert(name: str) -> None:
     if not name:
         return
+    if len(_player_alert_count) >= _COOLDOWN_CAP:
+        _sweep_expired_cooldowns(force=True)
     key = name.lower().strip()
     _player_alert_count[key] = _player_alert_count.get(key, 0) + 1
     if key not in _player_alert_time:
@@ -173,7 +180,6 @@ async def _register_rules(client: httpx.AsyncClient) -> None:
 
 
 def _normalize_ws_tweet(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize flat WS payloads to nested format. No-ops for REST/test payloads."""
     data = dict(raw)
 
     if "screen_name" in data and "author" not in data:
@@ -202,7 +208,7 @@ def _get_nested_str(data: dict[str, Any], key: str, nested_key: str) -> str:
 
 
 def _extract_reporter_handle(data: dict[str, Any]) -> str:
-    # After _normalize_ws_tweet, all payloads use nested author object.
+    # WebSocket, REST, and test payloads use inconsistent author field shapes
     for obj_key, field_key in (("author", "username"), ("author", "userName"), ("user", "screen_name")):
         handle = _get_nested_str(data, obj_key, field_key)
         if handle:
@@ -223,7 +229,14 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
     text = data.get("text", "")
     created_at = data.get("created_at") or data.get("createdAt")
     reporter_handle = _extract_reporter_handle(data)
-    if not created_at:
+    if created_at:
+        try:
+            tweet_time = datetime.fromisoformat(created_at)
+            delivery_lag = time.time() - tweet_time.timestamp()
+            logger.info("tweet %s delivery_lag=%.1fs reporter=%s", tweet_id, delivery_lag, reporter_handle)
+        except ValueError:
+            logger.debug("unparseable created_at for tweet %s: %s", tweet_id, created_at)
+    else:
         logger.warning("tweet %s has no timestamp field", tweet_id or "<missing id>")
 
     if not tweet_id or not text or not reporter_handle:
@@ -248,12 +261,10 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         raw_payload={"tweet_id": tweet_id, "text": text, "reporter_handle": reporter_handle},
     )
 
-    # Debug visibility: fire every phrase match before filtering so operators can audit rejections
+    # Operators see every phrase match to audit false rejections downstream
     tl = text.lower()
     if any(phrase in tl for phrase in PINCH_HIT_PHRASES):
-        await post_unfiltered_alert(tweet_text=text, reporter_handle=reporter_handle, client=client)
-
-    await refresh_if_stale()
+        schedule_background(post_unfiltered_alert(tweet_text=text, reporter_handle=reporter_handle, client=client), "unfiltered_alert")
 
     result: TweetResult = await process_tweet(
         tweet_id=tweet_id,
@@ -285,6 +296,27 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
         raw_payload={"tweet_id": tweet_id, "text": text},
     )
 
+    try:
+        claimed = await try_claim_tweet(tweet_id)
+    except Exception:
+        logger.exception("failed to claim tweet %s", tweet_id)
+        raise
+    if not claimed:
+        logger.info("duplicate tweet %s; skipping", tweet_id)
+        return
+
+    try:
+        alert_id = await insert_provisional_alert(
+            pinch_hitter_raw=result["pinch_hitter_raw"],
+            pinch_hitter_normalized=result["pinch_hitter_normalized"],
+            team_id=result["team_id"],
+            tweet_id=tweet_id,
+            replaced_player=result["replaced_player"],
+        )
+    except Exception:
+        logger.exception("provisional insert failed for tweet %s", tweet_id)
+        raise
+
     message_id = await post_initial_alert(
         pinch_hitter=result["pinch_hitter_raw"],
         team=result["team"],
@@ -296,35 +328,23 @@ async def _handle_message(data: dict[str, Any], client: httpx.AsyncClient) -> No
     )
 
     if not message_id:
-        logger.error("Discord post failed for tweet %s; skipping DB insert", tweet_id)
+        logger.error("Discord post failed for tweet %s; removing provisional row", tweet_id)
+        try:
+            await delete_alert(alert_id)
+        except Exception:
+            logger.critical("failed to delete provisional alert %s after Discord failure", alert_id, exc_info=True)
         return
 
     try:
-        claimed = await try_claim_tweet(tweet_id)
+        await update_alert_message_id(alert_id, message_id)
     except Exception:
-        logger.exception("failed to claim tweet %s", tweet_id)
+        logger.exception("failed to backfill message_id for alert %s", alert_id)
         if not await delete_message(message_id, client):
-            logger.critical("ORPHANED ALERT: message %s has no DB row and could not be deleted", message_id)
-        raise
-    if not claimed:
-        logger.info("duplicate tweet %s; deleting duplicate Discord alert", tweet_id)
-        if not await delete_message(message_id, client):
-            logger.error("ORPHANED DUPLICATE: message %s for tweet %s could not be deleted", message_id, tweet_id)
-        return
-
-    try:
-        await insert_pending_alert(
-            discord_message_id=message_id,
-            pinch_hitter_raw=result["pinch_hitter_raw"],
-            pinch_hitter_normalized=result["pinch_hitter_normalized"],
-            team_id=result["team_id"],
-            tweet_id=tweet_id,
-            replaced_player=result["replaced_player"],
-        )
-    except Exception:
-        logger.exception("DB insert failed for tweet %s; deleting Discord alert", tweet_id)
-        if not await delete_message(message_id, client):
-            logger.critical("ORPHANED ALERT: message %s has no DB row and could not be deleted", message_id)
+            logger.critical("ORPHANED ALERT: message %s has no valid DB row", message_id)
+        try:
+            await delete_alert(alert_id)
+        except Exception:
+            logger.exception("failed to delete provisional alert %s during cleanup", alert_id)
         raise
 
     log_event(
@@ -360,15 +380,18 @@ async def _handle_tweet_batch(event_type: str, msg: dict[str, Any], client: http
         logger.warning("%s event has non-list tweets payload: %r", event_type, tweets)
         return
 
+    tasks = []
     for tweet in tweets:
         if not isinstance(tweet, dict):
             logger.warning("%s event has non-dict tweet payload: %r", event_type, tweet)
             continue
-        try:
-            normalized = _normalize_ws_tweet(tweet)
-            await _handle_message(normalized, client)
-        except Exception:
-            logger.exception("failed to process WS %s tweet id=%s", event_type, tweet.get("id", "?"))
+        normalized = _normalize_ws_tweet(tweet)
+        tasks.append(_handle_message(normalized, client))
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.exception("failed to process WS %s tweet", event_type, exc_info=r)
 
 
 async def init_twitter() -> None:

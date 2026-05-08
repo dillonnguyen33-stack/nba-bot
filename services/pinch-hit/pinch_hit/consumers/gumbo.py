@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -8,6 +9,7 @@ from typing import Any
 import httpx
 from rapidfuzz.distance import Levenshtein
 
+from pinch_hit.state.background import schedule_background
 from pinch_hit.alerts.discord import (
     build_confirmed_embed,
     build_green_embed,
@@ -44,7 +46,6 @@ _game_pool: dict[int, asyncio.Task[None]] = {}
 def _on_game_done(task: asyncio.Task[None]) -> None:
     if not task.cancelled() and task.exception():
         logger.error("game poller crashed", exc_info=task.exception())
-        from pinch_hit.state.background import schedule_background
         schedule_background(
             post_ops_alert(f"Game poller crashed unexpectedly: {task.exception()}"),
             "game_crash_ops_alert",
@@ -67,7 +68,6 @@ def _match_alert(gumbo_name: str, alert: PendingAlertRow) -> bool:
 async def _handle_substitution(
     play_event: dict[str, Any], play: dict[str, Any], game_pk: int,
     home_team_id: int, away_team_id: int,
-    home_team_name: str, away_team_name: str,
     client: httpx.AsyncClient,
 ) -> None:
     description = play_event.get("details", {}).get("description")
@@ -99,15 +99,25 @@ async def _handle_substitution(
         if not patched:
             logger.error("Discord PATCH failed for alert %s; leaving DB pending", matched["id"])
             return
-        try:
-            await update_alert_status(matched["id"], STATUS_CONFIRMED, game_pk=game_pk)
-        except Exception:
-            # Discord PATCH succeeded but DB write failed — these aren't in a single
-            # transaction, so the timeout watcher may later overwrite the embed to grey.
-            logger.critical("DB update failed AFTER Discord PATCH for alert %s", matched["id"], exc_info=True)
+        db_updated = False
+        for attempt in range(3):
+            try:
+                await update_alert_status(matched["id"], STATUS_CONFIRMED, game_pk=game_pk)
+                db_updated = True
+                break
+            except Exception:
+                logger.warning(
+                    "DB update attempt %s/3 failed for alert %s",
+                    attempt + 1, matched["id"], exc_info=(attempt == 2),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+
+        if not db_updated:
+            logger.critical("DB update failed AFTER Discord PATCH for alert %s", matched["id"])
             try:
                 await post_ops_alert(
-                    f"CRITICAL: Alert {matched['id']} shows CONFIRMED on Discord but DB update failed. May revert to UNCONFIRMED on timeout.",
+                    f"CRITICAL: Alert {matched['id']} shows CONFIRMED on Discord but DB update failed after 3 retries. May revert to UNCONFIRMED on timeout.",
                     client,
                 )
             except Exception:
@@ -136,7 +146,6 @@ async def _handle_substitution(
 
 async def _poll_game(
     game_pk: int, home_team_id: int, away_team_id: int,
-    home_team_name: str, away_team_name: str,
     client: httpx.AsyncClient,
 ) -> None:
     last_play_count = 0
@@ -149,7 +158,7 @@ async def _poll_game(
             r = await client.get(FEED_URL.format(game_pk=game_pk))
             r.raise_for_status()
             data = r.json()
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, json.JSONDecodeError):
             consecutive_errors += 1
             logger.exception("game %s poll failed consecutive_errors=%s", game_pk, consecutive_errors)
             if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
@@ -184,12 +193,10 @@ async def _poll_game(
                         await _handle_substitution(
                             pe, play, game_pk,
                             home_team_id, away_team_id,
-                            home_team_name, away_team_name,
                             client,
                         )
                     except Exception:
                         logger.exception("substitution handler failed game=%s", game_pk)
-                        from pinch_hit.state.background import schedule_background
                         schedule_background(
                             post_ops_alert(f"Substitution handler failed for game {game_pk}. A confirmation may have been missed."),
                             "substitution_handler_error_ops",
@@ -233,8 +240,6 @@ async def _fetch_qualifying_games(client: httpx.AsyncClient) -> list[QualifyingG
                 "game_pk": game_pk,
                 "home_team_id": home.get("team", {}).get("id", 0),
                 "away_team_id": away.get("team", {}).get("id", 0),
-                "home_team_name": home.get("team", {}).get("name", ""),
-                "away_team_name": away.get("team", {}).get("name", ""),
                 "inning": inning,
             })
     return results
@@ -306,7 +311,6 @@ async def schedule_poller() -> None:
                                 _poll_game(
                                     game_pk,
                                     game["home_team_id"], game["away_team_id"],
-                                    game["home_team_name"], game["away_team_name"],
                                     client,
                                 )
                             )
@@ -314,8 +318,7 @@ async def schedule_poller() -> None:
                             _game_pool[game_pk] = task
                             logger.info("spawned subscriber for game %s inning=%s", game_pk, inning)
 
-                    # _poll_game removes itself on normal exit, but an unhandled exception
-                    # skips that cleanup — sweep here to avoid leaking done tasks.
+                    # Sweep tasks that crashed without self-removing from the pool
                     done_pks = [gp for gp, task in list(_game_pool.items()) if task.done()]
                     for gp in done_pks:
                         _game_pool.pop(gp, None)

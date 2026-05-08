@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -13,37 +14,19 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 
-def _load_env() -> None:
-    """Load .env file from project root if it exists. No-op on Railway."""
-    env_path = Path(__file__).parent.parent / ".env"
-    if not env_path.is_file():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:]
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
+from dotenv import load_dotenv
 
-
-_load_env()
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from pinch_hit.parsing.llm import close_llm_client  # noqa: E402
 from pinch_hit.consumers.gumbo import schedule_poller  # noqa: E402
 from pinch_hit.consumers import twitter as twitter_mod  # noqa: E402
 from pinch_hit.consumers.twitter import close_twitter, init_twitter, twitter_consumer  # noqa: E402
+from pinch_hit.parsing.tweet import ROSTER_STALE_SECONDS, refresh_if_stale  # noqa: E402
 from pinch_hit.logging_config import configure_logging  # noqa: E402
 from pinch_hit.state.background import drain_background_tasks  # noqa: E402
 from pinch_hit.state.db import close_db, init_db  # noqa: E402
-from pinch_hit.state.repository import nightly_cleanup  # noqa: E402
+from pinch_hit.state.repository import cleanup_provisional_alerts, nightly_cleanup  # noqa: E402
 from pinch_hit.state.runtime import runtime_state  # noqa: E402
 from pinch_hit.workers.health import health_monitor  # noqa: E402
 from pinch_hit.workers.timeout import timeout_watcher  # noqa: E402
@@ -73,7 +56,7 @@ def _build_response(status: str, body: bytes) -> bytes:
     return f"HTTP/1.0 {status}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
 
 
-async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, int]:
+async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, int, dict[str, str]]:
     # readuntil is implicitly capped at 64 KB by asyncio.StreamReader's buffer limit.
     headers_raw = await reader.readuntil(b"\r\n\r\n")
     header_text = headers_raw.decode("iso-8859-1")
@@ -86,13 +69,16 @@ async def _read_http_request(reader: asyncio.StreamReader) -> tuple[str, str, in
     method, target, _version = parts
     path = target.split("?", 1)[0]
 
-    content_length = 0
+    headers: dict[str, str] = {}
     for line in lines[1:]:
-        if line.lower().startswith("content-length:"):
-            content_length = int(line.split(":", 1)[1].strip())
-            break
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        headers[key.strip().lower()] = value.strip()
 
-    return method.upper(), path, content_length
+    content_length = int(headers.get("content-length", "0"))
+
+    return method.upper(), path, content_length, headers
 
 
 def _health_response() -> tuple[str, bytes]:
@@ -152,7 +138,7 @@ async def _handle_test_tweet(reader: asyncio.StreamReader, content_length: int) 
 async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
         try:
-            method, path, content_length = await asyncio.wait_for(
+            method, path, content_length, headers = await asyncio.wait_for(
                 _read_http_request(reader), timeout=_REQUEST_TIMEOUT
             )
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, UnicodeDecodeError, ValueError):
@@ -169,7 +155,12 @@ async def _handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         if method == "GET" and path == "/health":
             status, response_body = _health_response()
         elif method == "POST" and path == "/test-tweet" and os.environ.get("ENABLE_TEST_ROUTES"):
-            status, response_body = await _handle_test_tweet(reader, content_length)
+            expected = os.environ.get("TEST_ROUTE_TOKEN", "")
+            provided = headers.get("authorization", "").removeprefix("Bearer ").strip()
+            if not expected or not hmac.compare_digest(expected, provided):
+                status, response_body = "401 Unauthorized", b"invalid or missing token"
+            else:
+                status, response_body = await _handle_test_tweet(reader, content_length)
         else:
             status, response_body = "404 Not Found", b"not found"
 
@@ -202,6 +193,16 @@ def _seconds_until_midnight_et() -> float:
     return (tomorrow - now).total_seconds()
 
 
+async def _roster_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(ROSTER_STALE_SECONDS)
+        try:
+            await refresh_if_stale()
+            logger.info("periodic roster refresh complete")
+        except Exception:
+            logger.exception("periodic roster refresh failed")
+
+
 async def _nightly_cleanup_loop() -> None:
     while True:
         secs = _seconds_until_midnight_et()
@@ -231,6 +232,9 @@ async def main() -> None:
     try:
         await init_db()
         logger.info("DB initialized")
+        orphaned = await cleanup_provisional_alerts()
+        if orphaned:
+            logger.warning("cleaned up %s provisional alerts from previous crash", orphaned)
 
         await init_twitter()
         logger.info("Twitter initialized")
@@ -248,6 +252,7 @@ async def main() -> None:
             _supervise(health_monitor, "health"),
             _supervise(_health_server, "health_server"),
             _supervise(_nightly_cleanup_loop, "cleanup"),
+            _supervise(_roster_refresh_loop, "roster_refresh"),
         )
 
         try:
