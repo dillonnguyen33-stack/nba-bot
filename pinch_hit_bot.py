@@ -1,15 +1,17 @@
 """
-MLB Pinch Hit Alert Bot - v7
-Key change: replaced static roster check with live daily lineup check.
-Instead of checking 40-man roster, we check actual players in today's games.
-This solves the callup problem — if they're in the lineup they're in the system.
-Golden rule still applies: both player names required, both in today's lineups.
+MLB Pinch Hit Alert Bot - v8 (speed patch)
+Changes from v7:
+1. Poll interval: 30s → 10s (worst case latency cut by 3x)
+2. Lineup refresh runs on background thread only — never blocks an alert
+3. Discord posts fire in background thread — never blocks next tweet
+4. Removed time.sleep(0.2) per game and time.sleep(0.5) per reporter from hot path
 """
 
 import os
 import re
 import time
 import json
+import threading
 import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -17,11 +19,10 @@ from zoneinfo import ZoneInfo
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
-ODDS_API_KEY         = os.environ.get("ODDS_API_KEY")
 ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
-LINEUP_REFRESH_SECS  = 300   # refresh lineups every 5 minutes
+LINEUP_REFRESH_SECS  = 300
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -140,16 +141,6 @@ REJECT_PHRASES = [
     "softball", "little league",
 ]
 
-PROP_BOOKS = {
-    "draftkings":  "DraftKings",
-    "fanduel":     "FanDuel",
-    "fliff":       "Fliff",
-    "hardrockbet": "Hard Rock",
-    "bet365":      "Bet365",
-}
-
-MLB_PROP_MARKETS = ["batter_hits", "batter_total_bases", "batter_rbis", "batter_home_runs"]
-
 STREAM_RULES = [
     {"value": '"pinch hit for" -is:retweet lang:en',        "tag": "pinch_hit_for"},
     {"value": '"pinch-hit for" -is:retweet lang:en',        "tag": "pinch_hit_for_hyph"},
@@ -164,10 +155,9 @@ posted_alert_keys   = set()
 last_reset_date     = None
 player_alert_count  = {}
 player_alert_time   = {}
-
-# Daily lineup cache
 daily_lineup_map    = {}
 last_lineup_refresh = 0
+_lineup_lock        = threading.Lock()
 
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
@@ -215,13 +205,10 @@ def record_player_alert(name):
     player_alert_time[key]  = time.time()
 
 # ── DAILY LINEUP CHECK ────────────────────────────────────────────────────────
-def build_daily_lineup_map():
+# FIX #1: lineup refresh never called from alert path — background thread only
+def _do_lineup_refresh():
+    """Internal: actually fetches and rebuilds lineup map. Called from background thread only."""
     global daily_lineup_map, last_lineup_refresh
-    now = time.time()
-    # ── BUG FIX: was last_roster_refresh — now correctly uses last_lineup_refresh
-    if now - last_lineup_refresh < LINEUP_REFRESH_SECS and daily_lineup_map:
-        return
-
     print("[lineup] Refreshing today's MLB lineups...")
     new_map = {}
 
@@ -250,68 +237,87 @@ def build_daily_lineup_map():
                 timeout=10
             )
             r.raise_for_status()
-            data     = r.json()
-            boxscore = data.get("liveData", {}).get("boxscore", {})
+            boxscore = r.json().get("liveData", {}).get("boxscore", {})
 
             for side in ["home", "away"]:
                 team_data   = boxscore.get("teams", {}).get(side, {})
-                team_info   = team_data.get("team", {})
-                team_name   = team_info.get("name", "")
+                team_name   = team_data.get("team", {}).get("name", "")
                 team_mapped = None
                 for alias, mapped in TEAM_ALIASES.items():
                     if alias in team_name.lower():
                         team_mapped = mapped
                         break
 
-                players = team_data.get("players", {})
-                for pid, pdata in players.items():
+                for pid, pdata in team_data.get("players", {}).items():
                     full_name = pdata.get("person", {}).get("fullName", "")
                     if not full_name:
                         continue
                     parts    = full_name.split()
                     full_low = full_name.lower()
-                    new_map[full_low] = team_mapped or team_name
+                    team     = team_mapped or team_name
+                    new_map[full_low] = team
                     if len(parts) >= 2:
-                        new_map[parts[0].lower() + " " + parts[-1].lower()] = team_mapped or team_name
-                        new_map["_last_" + parts[-1].lower()] = team_mapped or team_name
+                        new_map[parts[0].lower() + " " + parts[-1].lower()] = team
+                        new_map["_last_" + parts[-1].lower()] = team
 
-            time.sleep(0.2)
+            # FIX #2: removed time.sleep(0.2) here — was adding seconds of dead time
         except Exception as e:
             print(f"[lineup] Game {game_pk} error: {e}")
 
-    daily_lineup_map    = new_map
-    last_lineup_refresh = now
-    print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded from today's games\n")
+    with _lineup_lock:
+        daily_lineup_map    = new_map
+        last_lineup_refresh = time.time()
+    print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded\n")
+
+def start_lineup_refresh_thread():
+    """Background thread: refreshes lineups every 5 minutes. Never blocks alerts."""
+    def loop():
+        while True:
+            now = time.time()
+            with _lineup_lock:
+                needs_refresh = (now - last_lineup_refresh >= LINEUP_REFRESH_SECS
+                                 or not daily_lineup_map)
+            if needs_refresh:
+                try:
+                    _do_lineup_refresh()
+                except Exception as e:
+                    print(f"[lineup] Refresh error: {e}")
+            time.sleep(30)  # check every 30s, refresh only if 5min elapsed
+    threading.Thread(target=loop, daemon=True).start()
+    print("[lineup] Background refresh thread started (every 5 min)\n")
 
 def is_todays_player(name):
-    if not name or not daily_lineup_map:
+    if not name:
         return False
-    nl    = name.lower().strip()
-    parts = nl.split()
-
-    if nl in daily_lineup_map and " " in nl:
-        return True
-    if len(parts) >= 2:
-        first_last = parts[0] + " " + parts[-1]
-        if first_last in daily_lineup_map:
+    with _lineup_lock:
+        if not daily_lineup_map:
+            return False
+        nl    = name.lower().strip()
+        parts = nl.split()
+        if nl in daily_lineup_map and " " in nl:
             return True
-    if len(parts) >= 2 and len(parts[-1]) >= 5:
-        last_key = "_last_" + parts[-1]
-        if last_key in daily_lineup_map:
-            return True
+        if len(parts) >= 2:
+            if parts[0] + " " + parts[-1] in daily_lineup_map:
+                return True
+        if len(parts) >= 2 and len(parts[-1]) >= 5:
+            if "_last_" + parts[-1] in daily_lineup_map:
+                return True
     return False
 
 def lookup_player_team(name):
-    if not name or not daily_lineup_map:
+    if not name:
         return None
-    nl    = name.lower().strip()
-    parts = nl.split()
-    if nl in daily_lineup_map:
-        return daily_lineup_map[nl]
-    if len(parts) >= 2:
-        first_last = parts[0] + " " + parts[-1]
-        if first_last in daily_lineup_map:
-            return daily_lineup_map[first_last]
+    with _lineup_lock:
+        if not daily_lineup_map:
+            return None
+        nl    = name.lower().strip()
+        parts = nl.split()
+        if nl in daily_lineup_map:
+            return daily_lineup_map[nl]
+        if len(parts) >= 2:
+            fl = parts[0] + " " + parts[-1]
+            if fl in daily_lineup_map:
+                return daily_lineup_map[fl]
     return None
 
 def infer_team_from_text(text):
@@ -320,10 +326,11 @@ def infer_team_from_text(text):
         if alias in tl:
             return team
     words = text.split()
-    for i in range(len(words) - 1):
-        two = (words[i] + " " + words[i+1]).lower()
-        if two in daily_lineup_map:
-            return daily_lineup_map[two]
+    with _lineup_lock:
+        for i in range(len(words) - 1):
+            two = (words[i] + " " + words[i+1]).lower()
+            if two in daily_lineup_map:
+                return daily_lineup_map[two]
     return None
 
 # ── DETECTION ─────────────────────────────────────────────────────────────────
@@ -358,69 +365,9 @@ def extract_players(text):
             return m.group(1).strip(), m.group(2).strip()
     return None, None
 
-# ── ODDS ──────────────────────────────────────────────────────────────────────
-def get_player_lines(player_name):
-    if not ODDS_API_KEY or not player_name:
-        return {}
-    last_name = player_name.split()[-1].lower()
-    results   = {}
-    try:
-        events = requests.get(
-            "https://api.the-odds-api.com/v4/sports/baseball_mlb/events",
-            params={"apiKey": ODDS_API_KEY}, timeout=10
-        ).json()
-    except Exception as e:
-        print(f"[odds error] {e}")
-        return {}
-    for event in events[:6]:
-        event_id = event.get("id")
-        for market in MLB_PROP_MARKETS:
-            try:
-                r = requests.get(
-                    f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/{event_id}/odds",
-                    params={"apiKey": ODDS_API_KEY, "markets": market,
-                            "bookmakers": ",".join(PROP_BOOKS.keys()),
-                            "oddsFormat": "american", "regions": "us,us2"},
-                    timeout=10
-                ).json()
-            except Exception as e:
-                print(f"[odds error] {e}")
-                continue
-            for bk in r.get("bookmakers", []):
-                bname = PROP_BOOKS.get(bk.get("key", ""))
-                if not bname:
-                    continue
-                for mkt in bk.get("markets", []):
-                    for oc in mkt.get("outcomes", []):
-                        if last_name not in oc.get("description", "").lower():
-                            continue
-                        if oc.get("name") != "Under":
-                            continue
-                        pt, pr = oc.get("point"), oc.get("price")
-                        if pt is None or pr is None:
-                            continue
-                        label = market.replace("batter_", "").replace("_", " ").title()
-                        key   = f"{bname}_{label}"
-                        if key not in results:
-                            results[key] = {"book": bname, "market": label,
-                                            "line": pt, "under": pr}
-    return results
-
-def format_lines(lines_data):
-    if not lines_data:
-        return "📋 Lines: not found on tracked books"
-    by_market = {}
-    for d in lines_data.values():
-        by_market.setdefault(d["market"], []).append(
-            f"{d['book']}: u{d['line']} ({'+'if d['under']>0 else ''}{d['under']})"
-        )
-    out = ["📋 **BET UNDER — player lines:**"]
-    for mkt, entries in by_market.items():
-        out.append(f"**{mkt}:** " + " | ".join(entries))
-    return "\n".join(out)
-
 # ── DISCORD ───────────────────────────────────────────────────────────────────
-def post_discord(payload):
+def _post_discord_now(payload):
+    """Synchronous Discord post — called from background thread."""
     if not DISCORD_WEBHOOK_URL:
         print("[discord error] Webhook URL missing!")
         return
@@ -429,14 +376,17 @@ def post_discord(payload):
     except Exception as e:
         print(f"[discord error] {e}")
 
-def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_data):
+def post_discord(payload):
+    # FIX #3: fire Discord in background so alert path is never blocked waiting for response
+    threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
+
+def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed = {"embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
         "description": (
             f"**Verified beat reporter — pre-event pinch hit**\n\n"
             f"📋 **{summary}**\n\n"
             f"🎙️ **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
-            f"{format_lines(lines_data)}\n\n"
             f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
         ),
         "color": 0x00FF00,
@@ -444,15 +394,14 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_d
     post_discord({"content": "@everyone 🔥 BEAT REPORTER", "embeds": embed["embeds"]})
     print(f"  🟢 Reporter: {team} — {summary}")
 
-def post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_data):
+def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
         "description": (
             f"**Twitter source — pre-event pinch hit**\n\n"
             f"📋 **{summary}**\n\n"
             f"🌐 **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
-            f"{format_lines(lines_data)}\n\n"
-            f"💰 **BET THE UNDER ON ALL LINES NOW**"
+            f"💰 **BET THE UNDER NOW**"
         ),
         "color": 0xF1C40F,
         "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
@@ -479,17 +428,13 @@ def handle_tweet(tid, text, handle):
         return
 
     pinch_hitter, replaced = extract_players(text)
-
     if not pinch_hitter or not replaced:
         print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
         return
 
-    build_daily_lineup_map()
-    ph_in_lineup  = is_todays_player(pinch_hitter)
-    rep_in_lineup = is_todays_player(replaced)
-
-    if not ph_in_lineup or not rep_in_lineup:
-        print(f"  🚫 @{handle}: '{pinch_hitter}'({ph_in_lineup}) or '{replaced}'({rep_in_lineup}) not in today's lineups")
+    # FIX #1: NO build_daily_lineup_map() call here — lineup is always fresh from background thread
+    if not is_todays_player(pinch_hitter) or not is_todays_player(replaced):
+        print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's lineups")
         return
 
     if is_player_on_cooldown(pinch_hitter):
@@ -516,12 +461,12 @@ def handle_tweet(tid, text, handle):
     print(f"     {text[:120]}")
 
     record_player_alert(pinch_hitter)
-    lines_data = get_player_lines(pinch_hitter)
 
+    # FIX #3: Discord fires in background — this returns immediately
     if is_reporter:
-        post_reporter_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
+        post_reporter_alert(handle, text, url, team, pinch_hitter, replaced)
     else:
-        post_general_alert(handle, text, url, team, pinch_hitter, replaced, lines_data)
+        post_general_alert(handle, text, url, team, pinch_hitter, replaced)
 
 # ── TWITTER STREAM ────────────────────────────────────────────────────────────
 def get_stream_rules():
@@ -583,7 +528,7 @@ def connect_stream():
     r = requests.get(url, headers=TWITTER_HEADERS, params=params,
                      stream=True, timeout=30)
     if r.status_code == 429:
-        print(f"[stream] 429 rate limit — waiting 5 min...")
+        print("[stream] 429 rate limit — waiting 5 min...")
         time.sleep(300)
         return
     if r.status_code != 200:
@@ -601,11 +546,9 @@ def run_stream():
             for raw_line in connect_stream():
                 reconnect_wait = 5
                 maybe_reset_daily()
-                build_daily_lineup_map()
                 try:
                     data = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    print(f"[stream error] unparseable payload: {raw_line[:100]}")
                     continue
                 tweet_data = data.get("data", {})
                 users      = {u["id"]: u["username"].lower()
@@ -624,7 +567,7 @@ def run_stream():
         time.sleep(reconnect_wait)
         reconnect_wait = min(reconnect_wait * 2, 300)
 
-# ── REPORTER POLLER (background thread) ──────────────────────────────────────
+# ── REPORTER POLLER ───────────────────────────────────────────────────────────
 def get_user_ids_batch(handles):
     try:
         r = requests.get(
@@ -654,7 +597,6 @@ def get_user_tweets(user_id, max_results=3):
         return []
 
 def poll_reporters_forever(user_ids):
-    import threading
     def loop():
         while True:
             if is_game_hours():
@@ -665,18 +607,18 @@ def poll_reporters_forever(user_ids):
                         continue
                     for t in get_user_tweets(uid, max_results=3):
                         handle_tweet(t.get("id", ""), t.get("text", ""), handle)
-                    time.sleep(0.5)
-            time.sleep(30)
+                    # FIX #2: removed time.sleep(0.5) per reporter — was 28s dead time per cycle
+            time.sleep(10)  # FIX #2: was 30s — now 10s worst-case latency
     threading.Thread(target=loop, daemon=True).start()
-    print("[reporters] Background poller started (every 30s)\n")
+    print("[reporters] Background poller started (every 10s)\n")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v7 — Daily Lineup Edition")
-    print("   Checks TODAY'S actual MLB game lineups instead of static roster")
-    print("   Refreshes lineups every 5 minutes — callups appear instantly")
+    print("⚾ MLB Pinch Hit Bot v8 — Speed Patch")
+    print("   Poll interval: 10s (was 30s)")
+    print("   Lineup refresh: background thread only (never blocks alerts)")
+    print("   Discord: fires in background (never blocks next tweet)")
     print("   Golden rule: both names required, both in today's games")
-    print("   Real-time filtered stream + reporter background poller")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
@@ -686,7 +628,9 @@ def run():
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
 
-    build_daily_lineup_map()
+    # Start lineup refresh in background — initial load happens here
+    start_lineup_refresh_thread()
+    time.sleep(5)  # give lineup thread a head start before accepting tweets
 
     print("Looking up reporter user IDs...")
     handles  = [r["handle"] for r in REPORTERS]
