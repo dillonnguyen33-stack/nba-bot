@@ -1,8 +1,11 @@
 """
-MLB Pinch Hit Alert Bot - v8.1 (max_results fix)
-Changes from v8:
-1. get_user_tweets: max_results default changed from 3 → 5 (Twitter API minimum)
-2. poll_reporters_forever: call updated to max_results=5
+MLB Pinch Hit Alert Bot - v8.7 (smart result-position + clause stripping)
+Changes from v8.1:
+1. Player name regex loosened — no longer requires strict Title Case
+2. PH/ph/Ph all accepted (case-insensitive matching throughout)
+3. Added "on deck to pinch hit for" with both player names
+4. Added "will ph for" / "will PH for" / "will be ph for" patterns
+5. Added "on deck to ph for" pattern
 """
 
 import os
@@ -125,18 +128,33 @@ CORE_PHRASES = [
     "will pinch hit",
     "pinch hitting for",
     "pinch-hitting for",
+    "will ph for",
+    "will be ph for",
+    "on deck to ph",
+    "ph for",
+    "phing for",
 ]
 
 REJECT_PHRASES = [
-    "home run", "homered",
-    "singled", "doubled", "tripled",
-    "drove in",
-    "pinch-hit home run", "pinch hit home run",
-    "pinch-hit single", "pinch hit single",
+    # time references
     "last night", "yesterday",
+    # non-MLB contexts
     "college", "university", "high school", "ncaa",
     "minor league", "minors", "triple-a", "double-a",
     "softball", "little league",
+    # explicit past tense pinch hit
+    "just pinch hit", "just pinch-hit",
+    "just ph'd", "just phd",
+    "pinch hit earlier", "pinch-hit earlier",
+    "already pinch hit", "already pinch-hit",
+    # passive constructions (already happened)
+    "has been pinch hit", "has been pinch-hit",
+    "was pinch hit", "was pinch-hit",
+    "have been pinch hit", "have been pinch-hit",
+    "got pinch hit", "got pinch-hit",
+    # result followed by "after being pinch hit"
+    "after being pinch hit", "after being pinch-hit",
+    "after pinch hit", "after ph",
 ]
 
 STREAM_RULES = [
@@ -145,6 +163,8 @@ STREAM_RULES = [
     {"value": '"on deck to pinch hit" -is:retweet lang:en', "tag": "on_deck"},
     {"value": '"slated to pinch hit" -is:retweet lang:en',  "tag": "slated"},
     {"value": '"will pinch hit" -is:retweet lang:en',       "tag": "will_ph"},
+    {"value": '"will ph for" -is:retweet lang:en',          "tag": "will_ph_abbrev"},
+    {"value": '"on deck to ph" -is:retweet lang:en',        "tag": "on_deck_ph_abbrev"},
 ]
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
@@ -204,7 +224,6 @@ def record_player_alert(name):
 
 # ── DAILY LINEUP CHECK ────────────────────────────────────────────────────────
 def _do_lineup_refresh():
-    """Internal: actually fetches and rebuilds lineup map. Called from background thread only."""
     global daily_lineup_map, last_lineup_refresh
     print("[lineup] Refreshing today's MLB lineups...")
     new_map = {}
@@ -266,7 +285,6 @@ def _do_lineup_refresh():
     print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded\n")
 
 def start_lineup_refresh_thread():
-    """Background thread: refreshes lineups every 5 minutes. Never blocks alerts."""
     def loop():
         while True:
             now = time.time()
@@ -337,6 +355,48 @@ def has_core_phrase(text):
     tl = text.lower()
     return any(phrase in tl for phrase in CORE_PHRASES)
 
+RESULT_WORDS = [
+    "home run", "homerun", "homered", "homer",
+    "singled", "doubled", "tripled",
+    "struck out", "strikeout", "walked", "grounded out", "flied out", "lined out",
+    "drove in", "rbi", "scored",
+]
+
+PINCH_HIT_PHRASES_LOWER = [
+    "pinch hit for", "pinch-hit for",
+    "pinch hitting for", "pinch-hitting for",
+    "will pinch hit", "will ph for", "ph for", "phing for",
+    "on deck to pinch hit", "slated to pinch hit",
+    "will be ph for", "on deck to ph",
+]
+
+def result_comes_after_ph(text):
+    """Reject if a result word (homered, singled, etc.) appears AFTER the ph phrase.
+    This allows 'Ohtani who homered earlier will ph for Freeman' (valid)
+    while blocking 'Ohtani ph for Freeman and homered' (already happened)."""
+    tl = text.lower()
+    ph_pos = -1
+    for phrase in PINCH_HIT_PHRASES_LOWER:
+        pos = tl.find(phrase)
+        if pos != -1 and (ph_pos == -1 or pos < ph_pos):
+            ph_pos = pos
+    if ph_pos == -1:
+        return False
+    after_text = tl[ph_pos:]
+    return any(word in after_text for word in RESULT_WORDS)
+
+def is_question(text):
+    """Reject tweets that are questions or speculation, not confirmations."""
+    stripped = text.strip()
+    # Ends with ? (possibly followed by emoji/spaces/punctuation)
+    if re.search(r"\?[\s\W]*$", stripped):
+        return True
+    tl = stripped.lower()
+    # Starts with a true question word (not will/is/are which appear in valid alerts)
+    if re.match(r"(did|does|would|should|could|can)\b", tl):
+        return True
+    return False
+
 def has_reject_phrase(text):
     tl = text.lower()
     for phrase in REJECT_PHRASES:
@@ -344,26 +404,76 @@ def has_reject_phrase(text):
             return True, phrase
     return False, None
 
+# Flexible name: 2+ words, any capitalization, allows hyphens and apostrophes
+# Uses a possessive pattern to avoid swallowing function words
+STOP_WORDS = r'(?:will|is|are|was|has|had|be|to|on|in|for|the|a|an|just|going|deck|slated|pinch|ph)'
+NAME = r"(?!" + STOP_WORDS + r"\b)([A-Za-z][A-Za-z'\-]{2,}(?:\s(?!" + STOP_WORDS + r"\b)[A-Za-z][A-Za-z'\-]{2,})*)"
+
+
+def preprocess_text(text):
+    """Strip relative clauses that obscure player name structure."""
+    # Handle ", who ... ," comma-enclosed relative clause
+    text = re.sub(r",\s+who\s+[^,]+,", " ", text, flags=re.IGNORECASE)
+    # Handle "who ..." without surrounding commas, up to next keyword
+    text = re.sub(r",?\s+who\s+[^,]+?(?=\s+(?:will|is|are|has|ph\b|pinch|slated|on\s+deck))", "", text, flags=re.IGNORECASE)
+    # Remove parentheticals like (2-for-3)
+    text = re.sub(r"\([^)]+\)", "", text)
+    # Clean up extra spaces
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip().lstrip(",").strip()
+
 def extract_players(text):
-    clean = strip_mentions(text)
-    patterns_both = [
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?(?:bat|hit)\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+slated\s+to\s+pinch[- ]hit\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+ph(?:ing)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+pinch[- ]hit(?:ting)?\s+for\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:has\s+)?left\s+the\s+game[^.]*?([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\s+(?:will\s+)?pinch',
+    clean = preprocess_text(strip_mentions(text))
+
+    # All patterns use re.IGNORECASE — handles PH/ph/Ph and any name casing
+    patterns = [
+        # "Player A will be on deck to pinch hit for Player B"
+        NAME + r'\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
+        # "Player A will pinch hit for Player B"
+        NAME + r'\s+will\s+pinch[- ]hit(?:ting)?\s+for\s+' + NAME,
+        # "Player A is on deck to pinch hit for Player B"
+        NAME + r'\s+(?:is\s+)?on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
+        # "Player A pinch hitting/hit for Player B"
+        NAME + r'\s+(?:is\s+)?pinch[- ]hit(?:ting)?\s+for\s+' + NAME,
+        # "Player A slated to pinch hit for Player B"
+        NAME + r'\s+slated\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
+        # "Player A will ph for Player B" / "will PH for" / "will be ph for"
+        NAME + r'\s+will\s+(?:be\s+)?ph\s+for\s+' + NAME,
+        # "Player A on deck to ph for Player B"
+        NAME + r'\s+(?:is\s+)?on\s+deck\s+to\s+ph\s+for\s+' + NAME,
+        # "Player A ph/phing for Player B"
+        NAME + r'\s+ph(?:ing)?\s+for\s+' + NAME,
+        # passive: "Player A is getting pinch hit for by Player B"
+        NAME + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + NAME,
+        # "Player A left the game ... Player B will pinch"
+        NAME + r'\s+(?:has\s+)?left\s+the\s+game[^.]*?' + NAME + r'\s+(?:will\s+)?pinch',
     ]
-    for p in patterns_both:
-        m = re.search(p, clean)
+
+    for p in patterns:
+        m = re.search(p, clean, re.IGNORECASE)
         if m:
             return m.group(1).strip(), m.group(2).strip()
+
+    # Fallback: try matching single capitalized last names (e.g. "Ohtani ph for Freeman")
+    single_name = r"([A-Z][A-Za-z'\-]+)"
+    fallback_patterns = [
+        single_name + r"\s+will\s+(?:be\s+)?ph\s+for\s+" + single_name,
+        single_name + r"\s+(?:is\s+)?on\s+deck\s+to\s+ph\s+for\s+" + single_name,
+        single_name + r"\s+(?:is\s+)?(?:on\s+deck\s+to\s+)?pinch[- ]hit(?:ting)?\s+for\s+" + single_name,
+        single_name + r"\s+will\s+pinch[- ]hit\s+for\s+" + single_name,
+        single_name + r"\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+" + single_name,
+        single_name + r"\s+slated\s+to\s+pinch[- ]hit\s+for\s+" + single_name,
+        single_name + r"\s+ph(?:ing)?\s+for\s+" + single_name,
+    ]
+    for p in fallback_patterns:
+        m = re.search(p, clean, re.IGNORECASE)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+
     return None, None
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def _post_discord_now(payload):
-    """Synchronous Discord post — called from background thread."""
     if not DISCORD_WEBHOOK_URL:
         print("[discord error] Webhook URL missing!")
         return
@@ -415,6 +525,14 @@ def handle_tweet(tid, text, handle):
     seen_tweet_ids.add(tid)
 
     if not has_core_phrase(text):
+        return
+
+    if is_question(text):
+        print(f"  🚫 @{handle}: question/speculation — {text[:60]}")
+        return
+
+    if result_comes_after_ph(text):
+        print(f"  🚫 @{handle}: result after ph (already happened) — {text[:60]}")
         return
 
     rejected, phrase = has_reject_phrase(text)
@@ -575,7 +693,7 @@ def get_user_ids_batch(handles):
         print(f"[user id error] {e}")
         return {}
 
-def get_user_tweets(user_id, max_results=5):  # FIX: was 3, Twitter API minimum is 5
+def get_user_tweets(user_id, max_results=5):
     try:
         r = requests.get(
             f"https://api.twitter.com/2/users/{user_id}/tweets",
@@ -598,7 +716,7 @@ def poll_reporters_forever(user_ids):
                     uid    = user_ids.get(handle)
                     if not uid:
                         continue
-                    for t in get_user_tweets(uid, max_results=5):  # FIX: was 3
+                    for t in get_user_tweets(uid, max_results=5):
                         handle_tweet(t.get("id", ""), t.get("text", ""), handle)
             time.sleep(10)
     threading.Thread(target=loop, daemon=True).start()
@@ -606,7 +724,7 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v8.1 — max_results fix")
+    print("⚾ MLB Pinch Hit Bot v8.2 — phrase + capitalization fix")
     print("   Poll interval: 10s")
     print("   Lineup refresh: background thread only (never blocks alerts)")
     print("   Discord: fires in background (never blocks next tweet)")
