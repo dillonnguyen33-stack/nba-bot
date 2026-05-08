@@ -165,7 +165,7 @@ last_reset_date     = None
 player_alert_count  = {}
 player_alert_time   = {}
 
-# Daily lineup cache — {full_name_lower: team_name}
+# Daily lineup cache
 daily_lineup_map    = {}
 last_lineup_refresh = 0
 
@@ -214,23 +214,18 @@ def record_player_alert(name):
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
 
-# ── DAILY LINEUP CHECK — replaces static roster ───────────────────────────────
+# ── DAILY LINEUP CHECK ────────────────────────────────────────────────────────
 def build_daily_lineup_map():
-    """
-    Pulls every player from today's MLB games (scheduled, pre-game, live).
-    Includes starting lineups AND bench players.
-    Refreshes every 5 minutes so callups appear quickly.
-    """
     global daily_lineup_map, last_lineup_refresh
     now = time.time()
-    if now - last_roster_refresh < 900 and player_team_map:  # 15min — catch in-game roster moves
+    # ── BUG FIX: was last_roster_refresh — now correctly uses last_lineup_refresh
+    if now - last_lineup_refresh < LINEUP_REFRESH_SECS and daily_lineup_map:
         return
 
     print("[lineup] Refreshing today's MLB lineups...")
     new_map = {}
 
     try:
-        # Get today's schedule
         today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
         sched = requests.get(
             "https://statsapi.mlb.com/api/v1/schedule",
@@ -262,7 +257,6 @@ def build_daily_lineup_map():
                 team_data   = boxscore.get("teams", {}).get(side, {})
                 team_info   = team_data.get("team", {})
                 team_name   = team_info.get("name", "")
-                # Map team name to our alias
                 team_mapped = None
                 for alias, mapped in TEAM_ALIASES.items():
                     if alias in team_name.lower():
@@ -278,9 +272,7 @@ def build_daily_lineup_map():
                     full_low = full_name.lower()
                     new_map[full_low] = team_mapped or team_name
                     if len(parts) >= 2:
-                        # first + last
                         new_map[parts[0].lower() + " " + parts[-1].lower()] = team_mapped or team_name
-                        # last name only — stored separately for fuzzy fallback
                         new_map["_last_" + parts[-1].lower()] = team_mapped or team_name
 
             time.sleep(0.2)
@@ -292,33 +284,21 @@ def build_daily_lineup_map():
     print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded from today's games\n")
 
 def is_todays_player(name):
-    """
-    Check if player is in today's MLB games.
-    First tries full name match, then first+last, then last name only as fallback.
-    Last name only requires the name has at least 2 parts (first + last).
-    """
     if not name or not daily_lineup_map:
         return False
-
     nl    = name.lower().strip()
     parts = nl.split()
 
-    # Full name match
     if nl in daily_lineup_map and " " in nl:
         return True
-
-    # First + last match (handles middle names)
     if len(parts) >= 2:
         first_last = parts[0] + " " + parts[-1]
         if first_last in daily_lineup_map:
             return True
-
-    # Last name fallback — only if last name is 5+ chars (avoids common short names)
     if len(parts) >= 2 and len(parts[-1]) >= 5:
         last_key = "_last_" + parts[-1]
         if last_key in daily_lineup_map:
             return True
-
     return False
 
 def lookup_player_team(name):
@@ -326,7 +306,6 @@ def lookup_player_team(name):
         return None
     nl    = name.lower().strip()
     parts = nl.split()
-
     if nl in daily_lineup_map:
         return daily_lineup_map[nl]
     if len(parts) >= 2:
@@ -501,12 +480,10 @@ def handle_tweet(tid, text, handle):
 
     pinch_hitter, replaced = extract_players(text)
 
-    # Golden rule — require both names
     if not pinch_hitter or not replaced:
         print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
         return
 
-    # Check both players are in today's actual MLB games
     build_daily_lineup_map()
     ph_in_lineup  = is_todays_player(pinch_hitter)
     rep_in_lineup = is_todays_player(replaced)
@@ -695,8 +672,11 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("MLB Pinch Hit Bot starting")
-    print(f"   Real-time filtered stream + reporter background poller")
+    print("⚾ MLB Pinch Hit Bot v7 — Daily Lineup Edition")
+    print("   Checks TODAY'S actual MLB game lineups instead of static roster")
+    print("   Refreshes lineups every 5 minutes — callups appear instantly")
+    print("   Golden rule: both names required, both in today's games")
+    print("   Real-time filtered stream + reporter background poller")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
