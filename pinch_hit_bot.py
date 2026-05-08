@@ -1,10 +1,8 @@
 """
-MLB Pinch Hit Alert Bot - v8 (speed patch)
-Changes from v7:
-1. Poll interval: 30s → 10s (worst case latency cut by 3x)
-2. Lineup refresh runs on background thread only — never blocks an alert
-3. Discord posts fire in background thread — never blocks next tweet
-4. Removed time.sleep(0.2) per game and time.sleep(0.5) per reporter from hot path
+MLB Pinch Hit Alert Bot - v8.1 (max_results fix)
+Changes from v8:
+1. get_user_tweets: max_results default changed from 3 → 5 (Twitter API minimum)
+2. poll_reporters_forever: call updated to max_results=5
 """
 
 import os
@@ -205,7 +203,6 @@ def record_player_alert(name):
     player_alert_time[key]  = time.time()
 
 # ── DAILY LINEUP CHECK ────────────────────────────────────────────────────────
-# FIX #1: lineup refresh never called from alert path — background thread only
 def _do_lineup_refresh():
     """Internal: actually fetches and rebuilds lineup map. Called from background thread only."""
     global daily_lineup_map, last_lineup_refresh
@@ -260,7 +257,6 @@ def _do_lineup_refresh():
                         new_map[parts[0].lower() + " " + parts[-1].lower()] = team
                         new_map["_last_" + parts[-1].lower()] = team
 
-            # FIX #2: removed time.sleep(0.2) here — was adding seconds of dead time
         except Exception as e:
             print(f"[lineup] Game {game_pk} error: {e}")
 
@@ -282,7 +278,7 @@ def start_lineup_refresh_thread():
                     _do_lineup_refresh()
                 except Exception as e:
                     print(f"[lineup] Refresh error: {e}")
-            time.sleep(30)  # check every 30s, refresh only if 5min elapsed
+            time.sleep(30)
     threading.Thread(target=loop, daemon=True).start()
     print("[lineup] Background refresh thread started (every 5 min)\n")
 
@@ -377,7 +373,6 @@ def _post_discord_now(payload):
         print(f"[discord error] {e}")
 
 def post_discord(payload):
-    # FIX #3: fire Discord in background so alert path is never blocked waiting for response
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
 
 def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
@@ -432,7 +427,6 @@ def handle_tweet(tid, text, handle):
         print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
         return
 
-    # FIX #1: NO build_daily_lineup_map() call here — lineup is always fresh from background thread
     if not is_todays_player(pinch_hitter) or not is_todays_player(replaced):
         print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's lineups")
         return
@@ -462,7 +456,6 @@ def handle_tweet(tid, text, handle):
 
     record_player_alert(pinch_hitter)
 
-    # FIX #3: Discord fires in background — this returns immediately
     if is_reporter:
         post_reporter_alert(handle, text, url, team, pinch_hitter, replaced)
     else:
@@ -582,7 +575,7 @@ def get_user_ids_batch(handles):
         print(f"[user id error] {e}")
         return {}
 
-def get_user_tweets(user_id, max_results=3):
+def get_user_tweets(user_id, max_results=5):  # FIX: was 3, Twitter API minimum is 5
     try:
         r = requests.get(
             f"https://api.twitter.com/2/users/{user_id}/tweets",
@@ -605,17 +598,16 @@ def poll_reporters_forever(user_ids):
                     uid    = user_ids.get(handle)
                     if not uid:
                         continue
-                    for t in get_user_tweets(uid, max_results=3):
+                    for t in get_user_tweets(uid, max_results=5):  # FIX: was 3
                         handle_tweet(t.get("id", ""), t.get("text", ""), handle)
-                    # FIX #2: removed time.sleep(0.5) per reporter — was 28s dead time per cycle
-            time.sleep(10)  # FIX #2: was 30s — now 10s worst-case latency
+            time.sleep(10)
     threading.Thread(target=loop, daemon=True).start()
     print("[reporters] Background poller started (every 10s)\n")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v8 — Speed Patch")
-    print("   Poll interval: 10s (was 30s)")
+    print("⚾ MLB Pinch Hit Bot v8.1 — max_results fix")
+    print("   Poll interval: 10s")
     print("   Lineup refresh: background thread only (never blocks alerts)")
     print("   Discord: fires in background (never blocks next tweet)")
     print("   Golden rule: both names required, both in today's games")
@@ -628,9 +620,8 @@ def run():
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
 
-    # Start lineup refresh in background — initial load happens here
     start_lineup_refresh_thread()
-    time.sleep(5)  # give lineup thread a head start before accepting tweets
+    time.sleep(5)
 
     print("Looking up reporter user IDs...")
     handles  = [r["handle"] for r in REPORTERS]
