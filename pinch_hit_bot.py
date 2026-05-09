@@ -1,11 +1,10 @@
 """
-MLB Pinch Hit Alert Bot - v8.7 (smart result-position + clause stripping)
-Changes from v8.1:
-1. Player name regex loosened — no longer requires strict Title Case
-2. PH/ph/Ph all accepted (case-insensitive matching throughout)
-3. Added "on deck to pinch hit for" with both player names
-4. Added "will ph for" / "will PH for" / "will be ph for" patterns
-5. Added "on deck to ph for" pattern
+MLB Pinch Hit Alert Bot - v9.0 (follow-up reply enrichment)
+Changes from v8.7:
+1. Main alert fires instantly — zero latency change
+2. Background thread fetches Twitter user info (verified, followers, tweet count)
+3. Posts a Discord reply to the original alert with team, account stats, validity score (1-10)
+4. Requires DISCORD_CHANNEL_ID env var (numeric channel ID) for reply threading
 """
 
 import os
@@ -20,6 +19,7 @@ from zoneinfo import ZoneInfo
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
+DISCORD_CHANNEL_ID   = os.environ.get("DISCORD_CHANNEL_ID")   # numeric channel ID for reply threading
 ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
@@ -136,23 +136,18 @@ CORE_PHRASES = [
 ]
 
 REJECT_PHRASES = [
-    # time references
     "last night", "yesterday",
-    # non-MLB contexts
     "college", "university", "high school", "ncaa",
     "minor league", "minors", "triple-a", "double-a",
     "softball", "little league",
-    # explicit past tense pinch hit
     "just pinch hit", "just pinch-hit",
     "just ph'd", "just phd",
     "pinch hit earlier", "pinch-hit earlier",
     "already pinch hit", "already pinch-hit",
-    # passive constructions (already happened)
     "has been pinch hit", "has been pinch-hit",
     "was pinch hit", "was pinch-hit",
     "have been pinch hit", "have been pinch-hit",
     "got pinch hit", "got pinch-hit",
-    # result followed by "after being pinch hit"
     "after being pinch hit", "after being pinch-hit",
     "after pinch hit", "after ph",
 ]
@@ -371,9 +366,6 @@ PINCH_HIT_PHRASES_LOWER = [
 ]
 
 def result_comes_after_ph(text):
-    """Reject if a result word (homered, singled, etc.) appears AFTER the ph phrase.
-    This allows 'Ohtani who homered earlier will ph for Freeman' (valid)
-    while blocking 'Ohtani ph for Freeman and homered' (already happened)."""
     tl = text.lower()
     ph_pos = -1
     for phrase in PINCH_HIT_PHRASES_LOWER:
@@ -386,13 +378,10 @@ def result_comes_after_ph(text):
     return any(word in after_text for word in RESULT_WORDS)
 
 def is_question(text):
-    """Reject tweets that are questions or speculation, not confirmations."""
     stripped = text.strip()
-    # Ends with ? (possibly followed by emoji/spaces/punctuation)
     if re.search(r"\?[\s\W]*$", stripped):
         return True
     tl = stripped.lower()
-    # Starts with a true question word (not will/is/are which appear in valid alerts)
     if re.match(r"(did|does|would|should|could|can)\b", tl):
         return True
     return False
@@ -404,48 +393,29 @@ def has_reject_phrase(text):
             return True, phrase
     return False, None
 
-# Flexible name: 2+ words, any capitalization, allows hyphens and apostrophes
-# Uses a possessive pattern to avoid swallowing function words
 STOP_WORDS = r'(?:will|is|are|was|has|had|be|to|on|in|for|the|a|an|just|going|deck|slated|pinch|ph)'
 NAME = r"(?!" + STOP_WORDS + r"\b)([A-Za-z][A-Za-z'\-]{2,}(?:\s(?!" + STOP_WORDS + r"\b)[A-Za-z][A-Za-z'\-]{2,})*)"
 
-
 def preprocess_text(text):
-    """Strip relative clauses that obscure player name structure."""
-    # Handle ", who ... ," comma-enclosed relative clause
     text = re.sub(r",\s+who\s+[^,]+,", " ", text, flags=re.IGNORECASE)
-    # Handle "who ..." without surrounding commas, up to next keyword
     text = re.sub(r",?\s+who\s+[^,]+?(?=\s+(?:will|is|are|has|ph\b|pinch|slated|on\s+deck))", "", text, flags=re.IGNORECASE)
-    # Remove parentheticals like (2-for-3)
     text = re.sub(r"\([^)]+\)", "", text)
-    # Clean up extra spaces
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip().lstrip(",").strip()
 
 def extract_players(text):
     clean = preprocess_text(strip_mentions(text))
 
-    # All patterns use re.IGNORECASE — handles PH/ph/Ph and any name casing
     patterns = [
-        # "Player A will be on deck to pinch hit for Player B"
         NAME + r'\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
-        # "Player A will pinch hit for Player B"
         NAME + r'\s+will\s+pinch[- ]hit(?:ting)?\s+for\s+' + NAME,
-        # "Player A is on deck to pinch hit for Player B"
         NAME + r'\s+(?:is\s+)?on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
-        # "Player A pinch hitting/hit for Player B"
         NAME + r'\s+(?:is\s+)?pinch[- ]hit(?:ting)?\s+for\s+' + NAME,
-        # "Player A slated to pinch hit for Player B"
         NAME + r'\s+slated\s+to\s+pinch[- ]hit\s+for\s+' + NAME,
-        # "Player A will ph for Player B" / "will PH for" / "will be ph for"
         NAME + r'\s+will\s+(?:be\s+)?ph\s+for\s+' + NAME,
-        # "Player A on deck to ph for Player B"
         NAME + r'\s+(?:is\s+)?on\s+deck\s+to\s+ph\s+for\s+' + NAME,
-        # "Player A ph/phing for Player B"
         NAME + r'\s+ph(?:ing)?\s+for\s+' + NAME,
-        # passive: "Player A is getting pinch hit for by Player B"
         NAME + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + NAME,
-        # "Player A left the game ... Player B will pinch"
         NAME + r'\s+(?:has\s+)?left\s+the\s+game[^.]*?' + NAME + r'\s+(?:will\s+)?pinch',
     ]
 
@@ -454,7 +424,6 @@ def extract_players(text):
         if m:
             return m.group(1).strip(), m.group(2).strip()
 
-    # Fallback: try matching single capitalized last names (e.g. "Ohtani ph for Freeman")
     single_name = r"([A-Z][A-Za-z'\-]+)"
     fallback_patterns = [
         single_name + r"\s+will\s+(?:be\s+)?ph\s+for\s+" + single_name,
@@ -473,44 +442,174 @@ def extract_players(text):
     return None, None
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
-def _post_discord_now(payload):
+def _post_discord_now(payload, return_msg_id=False):
+    """Post to Discord. If return_msg_id=True, uses ?wait=true and returns the message ID."""
     if not DISCORD_WEBHOOK_URL:
         print("[discord error] Webhook URL missing!")
-        return
+        return None
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
+        url = DISCORD_WEBHOOK_URL + ("?wait=true" if return_msg_id else "")
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        if return_msg_id:
+            return r.json().get("id")
     except Exception as e:
         print(f"[discord error] {e}")
+    return None
 
 def post_discord(payload):
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
 
+# ── ENRICHMENT (FOLLOW-UP REPLY) ──────────────────────────────────────────────
+def fetch_twitter_user_info(handle):
+    """Fetch follower count, tweet count, verified status for a Twitter handle."""
+    try:
+        r = requests.get(
+            f"https://api.twitter.com/2/users/by/username/{handle}",
+            headers=TWITTER_HEADERS,
+            params={"user.fields": "public_metrics,verified,created_at"},
+            timeout=8
+        )
+        r.raise_for_status()
+        u = r.json().get("data", {})
+        metrics = u.get("public_metrics", {})
+        return {
+            "verified":    u.get("verified", False),
+            "tweet_count": metrics.get("tweet_count", 0),
+            "followers":   metrics.get("followers_count", 0),
+        }
+    except Exception as e:
+        print(f"[user info error] {e}")
+        return None
+
+def compute_validity_rating(user_info, is_reporter):
+    """Return (score 1-10, label, reasons list)."""
+    score   = 5
+    reasons = []
+
+    if is_reporter:
+        score += 3
+        reasons.append("✅ Verified MLB beat reporter")
+    elif user_info:
+        if user_info["verified"]:
+            score += 2
+            reasons.append("✅ Verified account")
+        followers = user_info["followers"]
+        if followers >= 50000:
+            score += 2
+            reasons.append(f"✅ Large following ({followers:,})")
+        elif followers >= 10000:
+            score += 1
+            reasons.append(f"⚠️ Mid-tier following ({followers:,})")
+        else:
+            score -= 1
+            reasons.append(f"⚠️ Small following ({followers:,})")
+        tweets = user_info["tweet_count"]
+        if tweets >= 10000:
+            reasons.append(f"📊 Active account ({tweets:,} tweets)")
+        else:
+            score -= 1
+            reasons.append(f"📊 Low tweet history ({tweets:,} tweets)")
+    else:
+        reasons.append("❓ Could not fetch account data")
+
+    score = max(1, min(10, score))
+    label = "🔴 LOW" if score <= 4 else "🟡 MEDIUM" if score <= 6 else "🟢 HIGH"
+    return score, label, reasons
+
+def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, replaced):
+    """Background: fetch enrichment data, then reply to the original Discord alert."""
+    def _run():
+        if not DISCORD_CHANNEL_ID:
+            print("[followup] DISCORD_CHANNEL_ID not set — skipping reply")
+            return
+
+        user_info = fetch_twitter_user_info(handle)
+        score, label, reasons = compute_validity_rating(user_info, is_reporter)
+
+        lines = [f"**📊 Alert Enrichment — @{handle}**\n"]
+        lines.append(f"🏟️ **Teams involved:** {team}")
+
+        if user_info:
+            lines.append(
+                f"👤 **Account:** "
+                f"{'✅ Verified' if user_info['verified'] else 'Unverified'} · "
+                f"{user_info['followers']:,} followers · "
+                f"{user_info['tweet_count']:,} tweets"
+            )
+        else:
+            lines.append("👤 **Account:** Could not fetch info")
+
+        if is_reporter:
+            lines.append(f"🎙️ **Source type:** Official {team} beat reporter")
+        else:
+            lines.append("🌐 **Source type:** General Twitter user")
+
+        lines.append(f"\n**Validity: {score}/10 — {label}**")
+        for reason in reasons:
+            lines.append(f"  {reason}")
+
+        payload = {
+            "content": "\n".join(lines),
+            "message_reference": {
+                "message_id":        message_id,
+                "channel_id":        DISCORD_CHANNEL_ID,
+                "fail_if_not_exists": False,
+            }
+        }
+        try:
+            requests.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10).raise_for_status()
+            print(f"  📎 Follow-up reply posted (msg_id={message_id})")
+        except Exception as e:
+            print(f"[followup error] {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+# ── ALERT SENDERS ─────────────────────────────────────────────────────────────
 def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
-    embed = {"embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
-        "description": (
-            f"**Verified beat reporter — pre-event pinch hit**\n\n"
-            f"📋 **{summary}**\n\n"
-            f"🎙️ **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
-            f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
-        ),
-        "color": 0x00FF00,
-        "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
-    post_discord({"content": "@everyone 🔥 BEAT REPORTER", "embeds": embed["embeds"]})
+    embed_payload = {
+        "content": "@everyone 🔥 BEAT REPORTER",
+        "embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
+            "description": (
+                f"**Verified beat reporter — pre-event pinch hit**\n\n"
+                f"📋 **{summary}**\n\n"
+                f"🎙️ **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
+                f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
+            ),
+            "color": 0x00FF00,
+            "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
+    }
+
+    def _send():
+        msg_id = _post_discord_now(embed_payload, return_msg_id=True)
+        if msg_id:
+            post_followup_reply(msg_id, handle, True, team, pinch_hitter, replaced)
+
+    threading.Thread(target=_send, daemon=True).start()
     print(f"  🟢 Reporter: {team} — {summary}")
 
 def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
-    embed = {"embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
-        "description": (
-            f"**Twitter source — pre-event pinch hit**\n\n"
-            f"📋 **{summary}**\n\n"
-            f"🌐 **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
-            f"💰 **BET THE UNDER NOW**"
-        ),
-        "color": 0xF1C40F,
-        "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]}
-    post_discord({"content": "@everyone", "embeds": embed["embeds"]})
+    embed_payload = {
+        "content": "@everyone",
+        "embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
+            "description": (
+                f"**Twitter source — pre-event pinch hit**\n\n"
+                f"📋 **{summary}**\n\n"
+                f"🌐 **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
+                f"💰 **BET THE UNDER NOW**"
+            ),
+            "color": 0xF1C40F,
+            "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
+    }
+
+    def _send():
+        msg_id = _post_discord_now(embed_payload, return_msg_id=True)
+        if msg_id:
+            post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced)
+
+    threading.Thread(target=_send, daemon=True).start()
     print(f"  🟡 General: {team} — {summary}")
 
 # ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
@@ -724,10 +823,11 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v8.2 — phrase + capitalization fix")
+    print("⚾ MLB Pinch Hit Bot v9.0 — follow-up reply enrichment")
     print("   Poll interval: 10s")
     print("   Lineup refresh: background thread only (never blocks alerts)")
     print("   Discord: fires in background (never blocks next tweet)")
+    print("   Follow-up: team + account stats + validity score reply (async)")
     print("   Golden rule: both names required, both in today's games")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
@@ -737,6 +837,8 @@ def run():
     if not DISCORD_WEBHOOK_URL:
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
+    if not DISCORD_CHANNEL_ID:
+        print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies will be skipped")
 
     start_lineup_refresh_thread()
     time.sleep(5)
