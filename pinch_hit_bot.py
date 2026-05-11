@@ -1,10 +1,11 @@
 """
-MLB Pinch Hit Alert Bot - v9.0 (follow-up reply enrichment)
-Changes from v8.7:
-1. Main alert fires instantly — zero latency change
-2. Background thread fetches Twitter user info (verified, followers, tweet count)
-3. Posts a Discord reply to the original alert with team, account stats, validity score (1-10)
-4. Requires DISCORD_CHANNEL_ID env var (numeric channel ID) for reply threading
+MLB Pinch Hit Alert Bot - v10.0
+Changes from v9.0:
+1. Full 26-man roster prefetch at startup — bench players now recognized
+2. Last name match threshold lowered to 3+ chars (was 5+)
+3. ASCII normalization — Latin players with accents now match (Acuña → acuna)
+4. Expanded phrase list — "sent up to hit for", "batting for", "up to hit for", etc.
+5. Claude AI clarifier — fires in background thread, posts follow-up reply with verdict
 """
 
 import os
@@ -12,6 +13,7 @@ import re
 import time
 import json
 import threading
+import unicodedata
 import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -19,11 +21,17 @@ from zoneinfo import ZoneInfo
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
-DISCORD_CHANNEL_ID   = os.environ.get("DISCORD_CHANNEL_ID")   # numeric channel ID for reply threading
+DISCORD_CHANNEL_ID   = os.environ.get("DISCORD_CHANNEL_ID")
+ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY")
 ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
 LINEUP_REFRESH_SECS  = 300
+
+# ── ASCII NORMALIZATION ───────────────────────────────────────────────────────
+def normalize(text):
+    """Strip accents and lowercase — Acuña → acuna, Báez → baez"""
+    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii").lower()
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -120,7 +128,9 @@ TEAM_ALIASES = {
     "giants": "Giants", "san francisco": "Giants",
 }
 
+# ── PHRASES ───────────────────────────────────────────────────────────────────
 CORE_PHRASES = [
+    # Original
     "pinch hit for",
     "pinch-hit for",
     "on deck to pinch hit",
@@ -133,6 +143,15 @@ CORE_PHRASES = [
     "on deck to ph",
     "ph for",
     "phing for",
+    # New expanded phrases
+    "sent up to hit for",
+    "sent up for",
+    "hitting in place of",
+    "batting for",
+    "up to hit for",
+    "in to hit for",
+    "called upon to hit for",
+    "coming up to hit for",
 ]
 
 REJECT_PHRASES = [
@@ -150,16 +169,21 @@ REJECT_PHRASES = [
     "got pinch hit", "got pinch-hit",
     "after being pinch hit", "after being pinch-hit",
     "after pinch hit", "after ph",
+    "pinched",
 ]
 
 STREAM_RULES = [
-    {"value": '"pinch hit for" -is:retweet lang:en',        "tag": "pinch_hit_for"},
-    {"value": '"pinch-hit for" -is:retweet lang:en',        "tag": "pinch_hit_for_hyph"},
-    {"value": '"on deck to pinch hit" -is:retweet lang:en', "tag": "on_deck"},
-    {"value": '"slated to pinch hit" -is:retweet lang:en',  "tag": "slated"},
-    {"value": '"will pinch hit" -is:retweet lang:en',       "tag": "will_ph"},
-    {"value": '"will ph for" -is:retweet lang:en',          "tag": "will_ph_abbrev"},
-    {"value": '"on deck to ph" -is:retweet lang:en',        "tag": "on_deck_ph_abbrev"},
+    {"value": '"pinch hit for" -is:retweet lang:en',          "tag": "pinch_hit_for"},
+    {"value": '"pinch-hit for" -is:retweet lang:en',          "tag": "pinch_hit_for_hyph"},
+    {"value": '"on deck to pinch hit" -is:retweet lang:en',   "tag": "on_deck"},
+    {"value": '"slated to pinch hit" -is:retweet lang:en',    "tag": "slated"},
+    {"value": '"will pinch hit" -is:retweet lang:en',         "tag": "will_ph"},
+    {"value": '"will ph for" -is:retweet lang:en',            "tag": "will_ph_abbrev"},
+    {"value": '"on deck to ph" -is:retweet lang:en',          "tag": "on_deck_ph_abbrev"},
+    {"value": '"sent up to hit for" -is:retweet lang:en',     "tag": "sent_up"},
+    {"value": '"hitting in place of" -is:retweet lang:en',    "tag": "in_place_of"},
+    {"value": '"sent up for" -is:retweet lang:en',            "tag": "sent_up_short"},
+    {"value": '"called upon to hit for" -is:retweet lang:en', "tag": "called_upon"},
 ]
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
@@ -203,7 +227,7 @@ def maybe_reset_daily():
 def is_player_on_cooldown(name):
     if not name:
         return False
-    key = name.lower().split()[-1]
+    key = normalize(name).split()[-1]
     now = time.time()
     if key in player_alert_time:
         if now - player_alert_time[key] > PLAYER_COOLDOWN_SEC:
@@ -213,11 +237,61 @@ def is_player_on_cooldown(name):
 def record_player_alert(name):
     if not name:
         return
-    key = name.lower().split()[-1]
+    key = normalize(name).split()[-1]
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
 
-# ── DAILY LINEUP CHECK ────────────────────────────────────────────────────────
+# ── ROSTER / LINEUP MAP ───────────────────────────────────────────────────────
+def _add_player_to_map(target_map, full_name, team_name):
+    """Normalize and add all name variants for a player into the map."""
+    if not full_name:
+        return
+    norm_full = normalize(full_name)
+    parts     = norm_full.split()
+    target_map[norm_full] = team_name
+    if len(parts) >= 2:
+        target_map[parts[0] + " " + parts[-1]] = team_name
+        # Last name only — lowered threshold to 3+ chars (was 5+)
+        if len(parts[-1]) >= 3:
+            target_map["_last_" + parts[-1]] = team_name
+
+def prefetch_full_rosters():
+    """Pull active 26-man rosters for all 30 teams at startup — runs once in background."""
+    def _run():
+        try:
+            teams_r = requests.get(
+                "https://statsapi.mlb.com/api/v1/teams",
+                params={"sportId": 1},
+                timeout=10
+            )
+            teams_r.raise_for_status()
+            team_ids = [t["id"] for t in teams_r.json().get("teams", [])]
+        except Exception as e:
+            print(f"[roster] Teams fetch error: {e}")
+            return
+
+        new_entries = {}
+        for tid in team_ids:
+            try:
+                r = requests.get(
+                    f"https://statsapi.mlb.com/api/v1/teams/{tid}/roster",
+                    params={"rosterType": "active"},
+                    timeout=10
+                )
+                r.raise_for_status()
+                for p in r.json().get("roster", []):
+                    full      = p.get("person", {}).get("fullName", "")
+                    team_name = p.get("team", {}).get("name", "Unknown")
+                    _add_player_to_map(new_entries, full, team_name)
+            except Exception as e:
+                print(f"[roster] Team {tid} error: {e}")
+
+        with _lineup_lock:
+            daily_lineup_map.update(new_entries)
+        print(f"[roster] Full rosters loaded — {len(new_entries)} entries added\n")
+
+    threading.Thread(target=_run, daemon=True).start()
+
 def _do_lineup_refresh():
     global daily_lineup_map, last_lineup_refresh
     print("[lineup] Refreshing today's MLB lineups...")
@@ -251,8 +325,8 @@ def _do_lineup_refresh():
             boxscore = r.json().get("liveData", {}).get("boxscore", {})
 
             for side in ["home", "away"]:
-                team_data   = boxscore.get("teams", {}).get(side, {})
-                team_name   = team_data.get("team", {}).get("name", "")
+                team_data = boxscore.get("teams", {}).get(side, {})
+                team_name = team_data.get("team", {}).get("name", "")
                 team_mapped = None
                 for alias, mapped in TEAM_ALIASES.items():
                     if alias in team_name.lower():
@@ -260,22 +334,15 @@ def _do_lineup_refresh():
                         break
 
                 for pid, pdata in team_data.get("players", {}).items():
-                    full_name = pdata.get("person", {}).get("fullName", "")
-                    if not full_name:
-                        continue
-                    parts    = full_name.split()
-                    full_low = full_name.lower()
-                    team     = team_mapped or team_name
-                    new_map[full_low] = team
-                    if len(parts) >= 2:
-                        new_map[parts[0].lower() + " " + parts[-1].lower()] = team
-                        new_map["_last_" + parts[-1].lower()] = team
+                    full = pdata.get("person", {}).get("fullName", "")
+                    team = team_mapped or team_name
+                    _add_player_to_map(new_map, full, team)
 
         except Exception as e:
             print(f"[lineup] Game {game_pk} error: {e}")
 
     with _lineup_lock:
-        daily_lineup_map    = new_map
+        daily_lineup_map.update(new_map)
         last_lineup_refresh = time.time()
     print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded\n")
 
@@ -301,14 +368,15 @@ def is_todays_player(name):
     with _lineup_lock:
         if not daily_lineup_map:
             return False
-        nl    = name.lower().strip()
+        nl    = normalize(name)
         parts = nl.split()
         if nl in daily_lineup_map and " " in nl:
             return True
         if len(parts) >= 2:
             if parts[0] + " " + parts[-1] in daily_lineup_map:
                 return True
-        if len(parts) >= 2 and len(parts[-1]) >= 5:
+        # Last name only — 3+ chars
+        if len(parts) >= 1 and len(parts[-1]) >= 3:
             if "_last_" + parts[-1] in daily_lineup_map:
                 return True
     return False
@@ -319,7 +387,7 @@ def lookup_player_team(name):
     with _lineup_lock:
         if not daily_lineup_map:
             return None
-        nl    = name.lower().strip()
+        nl    = normalize(name)
         parts = nl.split()
         if nl in daily_lineup_map:
             return daily_lineup_map[nl]
@@ -327,17 +395,21 @@ def lookup_player_team(name):
             fl = parts[0] + " " + parts[-1]
             if fl in daily_lineup_map:
                 return daily_lineup_map[fl]
+        if len(parts) >= 1 and len(parts[-1]) >= 3:
+            key = "_last_" + parts[-1]
+            if key in daily_lineup_map:
+                return daily_lineup_map[key]
     return None
 
 def infer_team_from_text(text):
-    tl = text.lower()
+    tl = normalize(text)
     for alias, team in TEAM_ALIASES.items():
         if alias in tl:
             return team
     words = text.split()
     with _lineup_lock:
         for i in range(len(words) - 1):
-            two = (words[i] + " " + words[i+1]).lower()
+            two = normalize(words[i] + " " + words[i+1])
             if two in daily_lineup_map:
                 return daily_lineup_map[two]
     return None
@@ -347,7 +419,7 @@ def strip_mentions(text):
     return re.sub(r'@\w+', '', text)
 
 def has_core_phrase(text):
-    tl = text.lower()
+    tl = normalize(text)
     return any(phrase in tl for phrase in CORE_PHRASES)
 
 RESULT_WORDS = [
@@ -363,10 +435,14 @@ PINCH_HIT_PHRASES_LOWER = [
     "will pinch hit", "will ph for", "ph for", "phing for",
     "on deck to pinch hit", "slated to pinch hit",
     "will be ph for", "on deck to ph",
+    "sent up to hit for", "sent up for",
+    "hitting in place of", "batting for",
+    "up to hit for", "in to hit for",
+    "called upon to hit for", "coming up to hit for",
 ]
 
 def result_comes_after_ph(text):
-    tl = text.lower()
+    tl = normalize(text)
     ph_pos = -1
     for phrase in PINCH_HIT_PHRASES_LOWER:
         pos = tl.find(phrase)
@@ -387,7 +463,7 @@ def is_question(text):
     return False
 
 def has_reject_phrase(text):
-    tl = text.lower()
+    tl = normalize(text)
     for phrase in REJECT_PHRASES:
         if phrase in tl:
             return True, phrase
@@ -417,6 +493,14 @@ def extract_players(text):
         NAME + r'\s+ph(?:ing)?\s+for\s+' + NAME,
         NAME + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + NAME,
         NAME + r'\s+(?:has\s+)?left\s+the\s+game[^.]*?' + NAME + r'\s+(?:will\s+)?pinch',
+        # New phrase patterns
+        NAME + r'\s+sent\s+up\s+(?:to\s+hit\s+)?for\s+' + NAME,
+        NAME + r'\s+hitting\s+in\s+place\s+of\s+' + NAME,
+        NAME + r'\s+batting\s+for\s+' + NAME,
+        NAME + r'\s+(?:is\s+)?up\s+to\s+hit\s+for\s+' + NAME,
+        NAME + r'\s+in\s+to\s+hit\s+for\s+' + NAME,
+        NAME + r'\s+called\s+upon\s+to\s+hit\s+for\s+' + NAME,
+        NAME + r'\s+coming\s+up\s+to\s+hit\s+for\s+' + NAME,
     ]
 
     for p in patterns:
@@ -433,6 +517,13 @@ def extract_players(text):
         single_name + r"\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+" + single_name,
         single_name + r"\s+slated\s+to\s+pinch[- ]hit\s+for\s+" + single_name,
         single_name + r"\s+ph(?:ing)?\s+for\s+" + single_name,
+        single_name + r"\s+sent\s+up\s+(?:to\s+hit\s+)?for\s+" + single_name,
+        single_name + r"\s+hitting\s+in\s+place\s+of\s+" + single_name,
+        single_name + r"\s+batting\s+for\s+" + single_name,
+        single_name + r"\s+(?:is\s+)?up\s+to\s+hit\s+for\s+" + single_name,
+        single_name + r"\s+in\s+to\s+hit\s+for\s+" + single_name,
+        single_name + r"\s+called\s+upon\s+to\s+hit\s+for\s+" + single_name,
+        single_name + r"\s+coming\s+up\s+to\s+hit\s+for\s+" + single_name,
     ]
     for p in fallback_patterns:
         m = re.search(p, clean, re.IGNORECASE)
@@ -441,9 +532,82 @@ def extract_players(text):
 
     return None, None
 
+# ── CLAUDE AI CLARIFIER ───────────────────────────────────────────────────────
+CLAUDE_SYSTEM_PROMPT = """You are an MLB pinch hit alert classifier. Your job is to determine if a tweet is reporting that a pinch hitter is ABOUT TO bat — meaning the at-bat has NOT happened yet and this is a pre-event alert.
+
+Answer only YES or NO.
+
+Rules:
+- YES if the tweet clearly states a player will/is about to pinch hit for another player, before the at-bat occurs
+- NO if the at-bat has already happened (past tense results like singled, homered, struck out)
+- NO if it is a question or speculation
+- NO if it references a historical game (last night, yesterday, last week)
+- NO if it is about minor leagues, college, or non-MLB baseball
+- NO if the word "pinched" appears (substitution already made)
+
+Examples:
+Tweet: "Mateo will pinch hit for Refsnyder" → YES
+Tweet: "Sending up Acuna for Albies in the 8th" → YES
+Tweet: "Jones sent up to hit for Smith" → YES
+Tweet: "Shaw pinched for Hoerner in the 7th" → NO
+Tweet: "Did they just pinch hit there?" → NO
+Tweet: "Mateo pinch hit for Refsnyder and singled to left" → NO
+Tweet: "Remember when Ortiz pinch hit back in 2004?" → NO
+Tweet: "Jones will be hitting in place of Smith" → YES
+Tweet: "batting for the cycle attempt here" → NO
+Tweet: "Johnson batting for Williams" → YES
+Tweet: "Dylan Beavers is on deck to pinch-hit for Tyler O'Neill." → YES
+Tweet: "Felix Reyes will pinch hit for Bryce Harper in the bottom of the first inning." → YES
+Tweet: "Tyler O'Neill draws a walk, and now Samuel Basallo will pinch-hit for Coby Mayo." → YES
+Tweet: "Melendez is hitting over .300 and always gets pinch hit for, Baty is hitting .200 and continues to get at bats against lefties" → NO
+Tweet: "Of all people, Alek Thomas launched a game-tying, pinch-hit two-run homer in the eighth inning of Game 4 of the 2023 NLCS off Craig Kimbrel" → NO
+Tweet: "CHANDLER SIMPSON PINCH HIT 2 RUN RBI SINGLE." → NO
+Tweet: "Wtf did they just have Felix Reyes PH for Bryce Harper?" → NO
+Tweet: "Josh Bell is pinch hitting for Matt Wallner, who was hit by a pitch when he batted in the sixth inning." → YES
+Tweet: "Austin Slater is out on deck to pinch hit for MJ Melendez." → YES
+
+Answer only YES or NO. Nothing else."""
+
+def claude_clarify(tweet_text, pinch_hitter, replaced, callback):
+    """
+    Calls Claude API in background to verify the tweet is a valid pre-event alert.
+    Calls callback(is_valid: bool, reasoning: str) when done.
+    Never blocks the main alert path.
+    """
+    if not ANTHROPIC_API_KEY:
+        callback(True, "No API key — skipping AI check")
+        return
+
+    def _run():
+        try:
+            prompt = f'Tweet: "{tweet_text}"\nPinch hitter detected: {pinch_hitter}\nReplacing: {replaced}'
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                json={
+                    "model":      "claude-sonnet-4-20250514",
+                    "max_tokens": 10,
+                    "system":     CLAUDE_SYSTEM_PROMPT,
+                    "messages":   [{"role": "user", "content": prompt}],
+                },
+                timeout=15
+            )
+            r.raise_for_status()
+            answer = r.json()["content"][0]["text"].strip().upper()
+            is_valid = answer.startswith("YES")
+            callback(is_valid, answer)
+        except Exception as e:
+            print(f"[claude] Error: {e}")
+            callback(True, f"AI check failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def _post_discord_now(payload, return_msg_id=False):
-    """Post to Discord. If return_msg_id=True, uses ?wait=true and returns the message ID."""
     if not DISCORD_WEBHOOK_URL:
         print("[discord error] Webhook URL missing!")
         return None
@@ -462,7 +626,6 @@ def post_discord(payload):
 
 # ── ENRICHMENT (FOLLOW-UP REPLY) ──────────────────────────────────────────────
 def fetch_twitter_user_info(handle):
-    """Fetch follower count, tweet count, verified status for a Twitter handle."""
     try:
         r = requests.get(
             f"https://api.twitter.com/2/users/by/username/{handle}",
@@ -471,7 +634,7 @@ def fetch_twitter_user_info(handle):
             timeout=8
         )
         r.raise_for_status()
-        u = r.json().get("data", {})
+        u       = r.json().get("data", {})
         metrics = u.get("public_metrics", {})
         return {
             "verified":    u.get("verified", False),
@@ -483,10 +646,8 @@ def fetch_twitter_user_info(handle):
         return None
 
 def compute_validity_rating(user_info, is_reporter):
-    """Return (score 1-10, label, reasons list)."""
     score   = 5
     reasons = []
-
     if is_reporter:
         score += 3
         reasons.append("✅ Verified MLB beat reporter")
@@ -512,23 +673,42 @@ def compute_validity_rating(user_info, is_reporter):
             reasons.append(f"📊 Low tweet history ({tweets:,} tweets)")
     else:
         reasons.append("❓ Could not fetch account data")
-
     score = max(1, min(10, score))
     label = "🔴 LOW" if score <= 4 else "🟡 MEDIUM" if score <= 6 else "🟢 HIGH"
     return score, label, reasons
 
-def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, replaced):
-    """Background: fetch enrichment data, then reply to the original Discord alert."""
+def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, replaced, tweet_text):
+    """Background: fetch enrichment + run Claude clarifier, then reply to the original Discord alert."""
     def _run():
         if not DISCORD_CHANNEL_ID:
             print("[followup] DISCORD_CHANNEL_ID not set — skipping reply")
             return
 
-        user_info = fetch_twitter_user_info(handle)
+        # Fetch Twitter user info and Claude verdict in parallel
+        user_info_result  = [None]
+        claude_result     = [True, "Pending"]
+
+        def _get_user():
+            user_info_result[0] = fetch_twitter_user_info(handle)
+
+        def _claude_done(is_valid, reasoning):
+            claude_result[0] = is_valid
+            claude_result[1] = reasoning
+
+        t1 = threading.Thread(target=_get_user)
+        t1.start()
+        claude_clarify(tweet_text, pinch_hitter, replaced, _claude_done)
+        t1.join(timeout=12)
+        time.sleep(12)  # Give Claude time to respond
+
+        user_info = user_info_result[0]
         score, label, reasons = compute_validity_rating(user_info, is_reporter)
+
+        ai_verdict = "✅ AI confirmed — pre-event alert" if claude_result[0] else "⚠️ AI flagged — may be invalid"
 
         lines = [f"**📊 Alert Enrichment — @{handle}**\n"]
         lines.append(f"🏟️ **Teams involved:** {team}")
+        lines.append(f"🤖 **AI Review:** {ai_verdict}")
 
         if user_info:
             lines.append(
@@ -552,14 +732,14 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
         payload = {
             "content": "\n".join(lines),
             "message_reference": {
-                "message_id":        message_id,
-                "channel_id":        DISCORD_CHANNEL_ID,
+                "message_id":         message_id,
+                "channel_id":         DISCORD_CHANNEL_ID,
                 "fail_if_not_exists": False,
             }
         }
         try:
             requests.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10).raise_for_status()
-            print(f"  📎 Follow-up reply posted (msg_id={message_id})")
+            print(f"  📎 Follow-up reply posted (msg_id={message_id}, AI={'✅' if claude_result[0] else '⚠️'})")
         except Exception as e:
             print(f"[followup error] {e}")
 
@@ -567,7 +747,7 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
 
 # ── ALERT SENDERS ─────────────────────────────────────────────────────────────
 def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
-    summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    summary       = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed_payload = {
         "content": "@everyone 🔥 BEAT REPORTER",
         "embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
@@ -584,13 +764,13 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
-            post_followup_reply(msg_id, handle, True, team, pinch_hitter, replaced)
+            post_followup_reply(msg_id, handle, True, team, pinch_hitter, replaced, text)
 
     threading.Thread(target=_send, daemon=True).start()
     print(f"  🟢 Reporter: {team} — {summary}")
 
 def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
-    summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    summary       = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed_payload = {
         "content": "@everyone",
         "embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
@@ -607,7 +787,7 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
-            post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced)
+            post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced, text)
 
     threading.Thread(target=_send, daemon=True).start()
     print(f"  🟡 General: {team} — {summary}")
@@ -645,7 +825,7 @@ def handle_tweet(tid, text, handle):
         return
 
     if not is_todays_player(pinch_hitter) or not is_todays_player(replaced):
-        print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's lineups")
+        print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's rosters")
         return
 
     if is_player_on_cooldown(pinch_hitter):
@@ -728,7 +908,7 @@ def setup_stream_rules():
     add_stream_rules()
 
 def connect_stream():
-    url = "https://api.twitter.com/2/tweets/search/stream"
+    url    = "https://api.twitter.com/2/tweets/search/stream"
     params = {
         "tweet.fields": "created_at,author_id,text",
         "expansions":   "author_id",
@@ -823,12 +1003,12 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v9.0 — follow-up reply enrichment")
-    print("   Poll interval: 10s")
-    print("   Lineup refresh: background thread only (never blocks alerts)")
-    print("   Discord: fires in background (never blocks next tweet)")
-    print("   Follow-up: team + account stats + validity score reply (async)")
-    print("   Golden rule: both names required, both in today's games")
+    print("⚾ MLB Pinch Hit Bot v10.0")
+    print("   ✅ Full 26-man roster prefetch at startup")
+    print("   ✅ Last name match: 3+ chars (was 5+)")
+    print("   ✅ ASCII normalization — Latin player names supported")
+    print("   ✅ Expanded phrase list (8 new phrases)")
+    print("   ✅ Claude AI clarifier — fires in background, never blocks alerts")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
@@ -839,8 +1019,11 @@ def run():
         return
     if not DISCORD_CHANNEL_ID:
         print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies will be skipped")
+    if not ANTHROPIC_API_KEY:
+        print("[warning] ANTHROPIC_API_KEY not set — AI clarifier will be skipped")
 
     start_lineup_refresh_thread()
+    prefetch_full_rosters()
     time.sleep(5)
 
     print("Looking up reporter user IDs...")
