@@ -1,11 +1,12 @@
 """
-MLB Pinch Hit Alert Bot - v10.0
-Changes from v9.0:
-1. Full 26-man roster prefetch at startup — bench players now recognized
-2. Last name match threshold lowered to 3+ chars (was 5+)
-3. ASCII normalization — Latin players with accents now match (Acuña → acuna)
-4. Expanded phrase list — "sent up to hit for", "batting for", "up to hit for", etc.
-5. Claude AI clarifier — fires in background thread, posts follow-up reply with verdict
+MLB Pinch Hit Alert Bot - v11.0
+Changes from v10.0:
+1. Suffix stripping — "Tatis Jr." → "tatis", fixes Jr./Sr./III mismatches
+2. Richer name index — first name, last name, full name, first+last variants all indexed
+3. Fuzzy match — 1-char typo tolerance for names 5+ chars (tweet typos no longer miss)
+4. Context pre-check — tweet must mention MLB team OR come from known reporter
+   before name matching runs (replaces college/softball noise without removing roster check)
+5. Fixed lineup refresh loop — was refreshing every 30s, now correctly every 5 min
 """
 
 import os
@@ -32,6 +33,84 @@ LINEUP_REFRESH_SECS  = 300
 def normalize(text):
     """Strip accents and lowercase — Acuña → acuna, Báez → baez"""
     return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode("ascii").lower()
+
+# ── SUFFIX STRIPPING ──────────────────────────────────────────────────────────
+_SUFFIXES = re.compile(r'\b(jr\.?|sr\.?|ii|iii|iv)\s*$', re.IGNORECASE)
+
+def strip_suffix(name):
+    """Fernando Tatis Jr. → fernando tatis"""
+    return _SUFFIXES.sub('', normalize(name)).strip()
+
+# ── NAME INDEX ────────────────────────────────────────────────────────────────
+# Populated at roster load. Never touched on the hot alert path.
+#
+# Keys stored per player:
+#   "firstname lastname"   → team   (full normalized, suffix stripped)
+#   "_last_lastname"       → team   (last name only, 3+ chars)
+#   "_first_firstname"     → team   (first name only, 5+ chars)
+
+_name_index = {}
+_name_lock  = threading.Lock()
+
+def _index_player(full_name, team_name, target=None):
+    """Add all lookup keys for one player into target (or _name_index if None)."""
+    if not full_name:
+        return
+    d     = target if target is not None else _name_index
+    norm  = strip_suffix(full_name)
+    parts = norm.split()
+    if not parts:
+        return
+
+    # Full name
+    d[norm] = team_name
+
+    # First + last only (handles middle names)
+    if len(parts) >= 2:
+        d[parts[0] + " " + parts[-1]] = team_name
+
+    # Last name only (3+ chars)
+    if len(parts[-1]) >= 3:
+        d["_last_" + parts[-1]] = team_name
+
+    # First name only (5+ chars)
+    if len(parts[0]) >= 5:
+        d["_first_" + parts[0]] = team_name
+
+def rebuild_index(new_entries):
+    """Merge new entries into the global name index (called after each roster load)."""
+    with _name_lock:
+        _name_index.update(new_entries)
+
+# ── FUZZY MATCH ───────────────────────────────────────────────────────────────
+def _levenshtein(a, b):
+    """Fast bounded Levenshtein — returns distance or 2 if clearly > 1."""
+    if abs(len(a) - len(b)) > 1:
+        return 2
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j] + (ca != cb), prev[j+1] + 1, curr[j] + 1))
+        prev = curr
+    return prev[-1]
+
+def _fuzzy_lookup(key, index):
+    """Exact lookup first. If miss and key is 5+ chars, try 1-char edit distance."""
+    if key in index:
+        return index[key]
+    if len(key) < 5:
+        return None
+    for ikey, team in index.items():
+        if ikey.startswith("_"):
+            continue
+        if abs(len(ikey) - len(key)) > 1:
+            continue
+        if _levenshtein(key, ikey) == 1:
+            return team
+    return None
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -130,7 +209,6 @@ TEAM_ALIASES = {
 
 # ── PHRASES ───────────────────────────────────────────────────────────────────
 CORE_PHRASES = [
-    # Original
     "pinch hit for",
     "pinch-hit for",
     "on deck to pinch hit",
@@ -143,7 +221,6 @@ CORE_PHRASES = [
     "on deck to ph",
     "ph for",
     "phing for",
-    # New expanded phrases
     "sent up to hit for",
     "sent up for",
     "hitting in place of",
@@ -221,13 +298,14 @@ def maybe_reset_daily():
         player_alert_time   = {}
         daily_lineup_map    = {}
         last_lineup_refresh = 0
+        _name_index.clear()
         last_reset_date     = today
 
 # ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
 def is_player_on_cooldown(name):
     if not name:
         return False
-    key = normalize(name).split()[-1]
+    key = strip_suffix(name).split()[-1]
     now = time.time()
     if key in player_alert_time:
         if now - player_alert_time[key] > PLAYER_COOLDOWN_SEC:
@@ -237,23 +315,24 @@ def is_player_on_cooldown(name):
 def record_player_alert(name):
     if not name:
         return
-    key = normalize(name).split()[-1]
+    key = strip_suffix(name).split()[-1]
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
 
 # ── ROSTER / LINEUP MAP ───────────────────────────────────────────────────────
 def _add_player_to_map(target_map, full_name, team_name):
-    """Normalize and add all name variants for a player into the map."""
+    """Normalize, strip suffix, and add all name variants into the map."""
     if not full_name:
         return
-    norm_full = normalize(full_name)
-    parts     = norm_full.split()
-    target_map[norm_full] = team_name
+    norm  = strip_suffix(full_name)
+    parts = norm.split()
+    target_map[norm] = team_name
     if len(parts) >= 2:
         target_map[parts[0] + " " + parts[-1]] = team_name
-        # Last name only — lowered threshold to 3+ chars (was 5+)
-        if len(parts[-1]) >= 3:
-            target_map["_last_" + parts[-1]] = team_name
+    if len(parts) >= 1 and len(parts[-1]) >= 3:
+        target_map["_last_" + parts[-1]] = team_name
+    if len(parts) >= 1 and len(parts[0]) >= 5:
+        target_map["_first_" + parts[0]] = team_name
 
 def prefetch_full_rosters():
     """Pull active 26-man rosters for all 30 teams at startup — runs once in background."""
@@ -288,6 +367,7 @@ def prefetch_full_rosters():
 
         with _lineup_lock:
             daily_lineup_map.update(new_entries)
+        rebuild_index(new_entries)
         print(f"[roster] Full rosters loaded — {len(new_entries)} entries added\n")
 
     threading.Thread(target=_run, daemon=True).start()
@@ -344,62 +424,78 @@ def _do_lineup_refresh():
     with _lineup_lock:
         daily_lineup_map.update(new_map)
         last_lineup_refresh = time.time()
-    print(f"[lineup] {len([k for k in new_map if not k.startswith('_last_')])} players loaded\n")
+    rebuild_index(new_map)
+    print(f"[lineup] {len([k for k in new_map if not k.startswith('_')])} players loaded\n")
 
 def start_lineup_refresh_thread():
+    """Fixed: sleeps LINEUP_REFRESH_SECS between runs instead of checking every 30s."""
     def loop():
         while True:
-            now = time.time()
-            with _lineup_lock:
-                needs_refresh = (now - last_lineup_refresh >= LINEUP_REFRESH_SECS
-                                 or not daily_lineup_map)
-            if needs_refresh:
-                try:
-                    _do_lineup_refresh()
-                except Exception as e:
-                    print(f"[lineup] Refresh error: {e}")
-            time.sleep(30)
+            try:
+                _do_lineup_refresh()
+            except Exception as e:
+                print(f"[lineup] Refresh error: {e}")
+            time.sleep(LINEUP_REFRESH_SECS)
     threading.Thread(target=loop, daemon=True).start()
     print("[lineup] Background refresh thread started (every 5 min)\n")
 
-def is_todays_player(name):
-    if not name:
-        return False
-    with _lineup_lock:
-        if not daily_lineup_map:
-            return False
-        nl    = normalize(name)
-        parts = nl.split()
-        if nl in daily_lineup_map and " " in nl:
-            return True
-        if len(parts) >= 2:
-            if parts[0] + " " + parts[-1] in daily_lineup_map:
-                return True
-        # Last name only — 3+ chars
-        if len(parts) >= 1 and len(parts[-1]) >= 3:
-            if "_last_" + parts[-1] in daily_lineup_map:
-                return True
-    return False
-
-def lookup_player_team(name):
+# ── PLAYER LOOKUP ─────────────────────────────────────────────────────────────
+def _resolve_name(name):
+    """
+    Try to find a player in _name_index using multiple strategies.
+    Returns team name string or None.
+    """
     if not name:
         return None
-    with _lineup_lock:
-        if not daily_lineup_map:
-            return None
-        nl    = normalize(name)
-        parts = nl.split()
-        if nl in daily_lineup_map:
-            return daily_lineup_map[nl]
-        if len(parts) >= 2:
-            fl = parts[0] + " " + parts[-1]
-            if fl in daily_lineup_map:
-                return daily_lineup_map[fl]
-        if len(parts) >= 1 and len(parts[-1]) >= 3:
-            key = "_last_" + parts[-1]
-            if key in daily_lineup_map:
-                return daily_lineup_map[key]
+
+    with _name_lock:
+        idx = dict(_name_index)  # snapshot — no lock held during fuzzy scan
+
+    norm  = strip_suffix(name)
+    parts = norm.split()
+
+    # 1. Full normalized name
+    if norm in idx:
+        return idx[norm]
+
+    # 2. First + last
+    if len(parts) >= 2:
+        fl = parts[0] + " " + parts[-1]
+        if fl in idx:
+            return idx[fl]
+
+    # 3. Last name only (3+ chars)
+    if parts and len(parts[-1]) >= 3:
+        key = "_last_" + parts[-1]
+        if key in idx:
+            return idx[key]
+
+    # 4. First name only (5+ chars)
+    if parts and len(parts[0]) >= 5:
+        key = "_first_" + parts[0]
+        if key in idx:
+            return idx[key]
+
+    # 5. Fuzzy full name (1-char typo, 5+ chars)
+    if len(norm) >= 5:
+        result = _fuzzy_lookup(norm, idx)
+        if result:
+            return result
+
+    # 6. Fuzzy last name only (5+ chars)
+    if parts and len(parts[-1]) >= 5:
+        last_idx = {k[6:]: v for k, v in idx.items() if k.startswith("_last_")}
+        result = _fuzzy_lookup(parts[-1], last_idx)
+        if result:
+            return result
+
     return None
+
+def is_todays_player(name):
+    return _resolve_name(name) is not None
+
+def lookup_player_team(name):
+    return _resolve_name(name)
 
 def infer_team_from_text(text):
     tl = normalize(text)
@@ -407,12 +503,26 @@ def infer_team_from_text(text):
         if alias in tl:
             return team
     words = text.split()
-    with _lineup_lock:
+    with _name_lock:
         for i in range(len(words) - 1):
-            two = normalize(words[i] + " " + words[i+1])
-            if two in daily_lineup_map:
-                return daily_lineup_map[two]
+            two = strip_suffix(words[i] + " " + words[i+1])
+            if two in _name_index:
+                return _name_index[two]
     return None
+
+# ── CONTEXT PRE-CHECK ─────────────────────────────────────────────────────────
+def tweet_has_mlb_context(text, handle):
+    """
+    Gate that runs before name matching — blocks college/softball noise.
+    Passes if tweet comes from a known reporter OR mentions an MLB team/city.
+    """
+    if handle.lower() in REPORTER_HANDLES:
+        return True
+    tl = normalize(text)
+    for alias in TEAM_ALIASES:
+        if alias in tl:
+            return True
+    return False
 
 # ── DETECTION ─────────────────────────────────────────────────────────────────
 def strip_mentions(text):
@@ -493,7 +603,6 @@ def extract_players(text):
         NAME + r'\s+ph(?:ing)?\s+for\s+' + NAME,
         NAME + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + NAME,
         NAME + r'\s+(?:has\s+)?left\s+the\s+game[^.]*?' + NAME + r'\s+(?:will\s+)?pinch',
-        # New phrase patterns
         NAME + r'\s+sent\s+up\s+(?:to\s+hit\s+)?for\s+' + NAME,
         NAME + r'\s+hitting\s+in\s+place\s+of\s+' + NAME,
         NAME + r'\s+batting\s+for\s+' + NAME,
@@ -569,11 +678,6 @@ Tweet: "Austin Slater is out on deck to pinch hit for MJ Melendez." → YES
 Answer only YES or NO. Nothing else."""
 
 def claude_clarify(tweet_text, pinch_hitter, replaced, callback):
-    """
-    Calls Claude API in background to verify the tweet is a valid pre-event alert.
-    Calls callback(is_valid: bool, reasoning: str) when done.
-    Never blocks the main alert path.
-    """
     if not ANTHROPIC_API_KEY:
         callback(True, "No API key — skipping AI check")
         return
@@ -678,15 +782,13 @@ def compute_validity_rating(user_info, is_reporter):
     return score, label, reasons
 
 def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, replaced, tweet_text):
-    """Background: fetch enrichment + run Claude clarifier, then reply to the original Discord alert."""
     def _run():
         if not DISCORD_CHANNEL_ID:
             print("[followup] DISCORD_CHANNEL_ID not set — skipping reply")
             return
 
-        # Fetch Twitter user info and Claude verdict in parallel
-        user_info_result  = [None]
-        claude_result     = [True, "Pending"]
+        user_info_result = [None]
+        claude_result    = [True, "Pending"]
 
         def _get_user():
             user_info_result[0] = fetch_twitter_user_info(handle)
@@ -699,7 +801,7 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
         t1.start()
         claude_clarify(tweet_text, pinch_hitter, replaced, _claude_done)
         t1.join(timeout=12)
-        time.sleep(12)  # Give Claude time to respond
+        time.sleep(12)
 
         user_info = user_info_result[0]
         score, label, reasons = compute_validity_rating(user_info, is_reporter)
@@ -817,6 +919,11 @@ def handle_tweet(tid, text, handle):
     rejected, phrase = has_reject_phrase(text)
     if rejected:
         print(f"  🚫 @{handle}: '{phrase}' — {text[:60]}")
+        return
+
+    # NEW: MLB context gate — blocks college/softball before name matching
+    if not tweet_has_mlb_context(text, handle):
+        print(f"  🚫 @{handle}: no MLB context — {text[:60]}")
         return
 
     pinch_hitter, replaced = extract_players(text)
@@ -1003,12 +1110,12 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v10.0")
-    print("   ✅ Full 26-man roster prefetch at startup")
-    print("   ✅ Last name match: 3+ chars (was 5+)")
-    print("   ✅ ASCII normalization — Latin player names supported")
-    print("   ✅ Expanded phrase list (8 new phrases)")
-    print("   ✅ Claude AI clarifier — fires in background, never blocks alerts")
+    print("⚾ MLB Pinch Hit Bot v11.0")
+    print("   ✅ Suffix stripping — Jr./Sr./III no longer cause mismatches")
+    print("   ✅ Richer name index — first, last, full, first+last all indexed")
+    print("   ✅ Fuzzy match — 1-char typo tolerance for names 5+ chars")
+    print("   ✅ MLB context gate — blocks college/softball before name matching")
+    print("   ✅ Lineup refresh fixed — every 5 min (was spamming every 30s)")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
