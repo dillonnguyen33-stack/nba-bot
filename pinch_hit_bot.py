@@ -1,10 +1,10 @@
 """
-MLB Pinch Hit Alert Bot - v12.0
-Changes from v11.0:
-1. Reporter bypass — verified beat reporters skip roster check entirely
-   (reporters are trusted; roster check was silently killing valid alerts)
-All v11.0 changes preserved:
-- Suffix stripping, richer name index, fuzzy match, MLB context gate, lineup refresh fix
+MLB Pinch Hit Alert Bot - v13.0
+Changes from v12.0:
+1. Drop log channel — every filtered tweet posts a compact message to a separate
+   Discord webhook (DISCORD_LOG_WEBHOOK_URL) so you can see what's being dropped and why
+All v12.0 changes preserved:
+- Reporter bypass, suffix stripping, richer name index, fuzzy match, MLB context gate, lineup refresh fix
 """
 
 import os
@@ -22,6 +22,7 @@ TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
 DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 DISCORD_CHANNEL_ID   = os.environ.get("DISCORD_CHANNEL_ID")
 ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY")
+DISCORD_LOG_WEBHOOK  = os.environ.get("DISCORD_LOG_WEBHOOK_URL")  # drop log channel
 ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
@@ -726,6 +727,25 @@ def _post_discord_now(payload, return_msg_id=False):
 def post_discord(payload):
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
 
+
+# ── DROP LOG ──────────────────────────────────────────────────────────────────
+def post_drop_log(handle, reason, text):
+    """Fire-and-forget: post a compact drop notice to the log webhook."""
+    if not DISCORD_LOG_WEBHOOK:
+        return
+    def _send():
+        try:
+            timestamp = datetime.now(ET_TZ).strftime("%H:%M:%S ET")
+            payload = {
+                "content": (
+                    f"`{timestamp}` 🚫 **@{handle}** dropped — *{reason}*\n"
+                    f">>> {text[:200]}"
+                )
+            }
+            requests.post(DISCORD_LOG_WEBHOOK, json=payload, timeout=8)
+        except Exception as e:
+            print(f"[log error] {e}")
+    threading.Thread(target=_send, daemon=True).start()
 # ── ENRICHMENT (FOLLOW-UP REPLY) ──────────────────────────────────────────────
 def fetch_twitter_user_info(handle):
     try:
@@ -908,25 +928,30 @@ def handle_tweet(tid, text, handle):
 
     if is_question(text):
         print(f"  🚫 @{handle}: question/speculation — {text[:60]}")
+        post_drop_log(handle, "question/speculation", text)
         return
 
     if result_comes_after_ph(text):
         print(f"  🚫 @{handle}: result after ph (already happened) — {text[:60]}")
+        post_drop_log(handle, "already happened", text)
         return
 
     rejected, phrase = has_reject_phrase(text)
     if rejected:
         print(f"  🚫 @{handle}: '{phrase}' — {text[:60]}")
+        post_drop_log(handle, f"reject phrase: {phrase}", text)
         return
 
-    # NEW: MLB context gate — blocks college/softball before name matching
+    # MLB context gate — blocks college/softball before name matching
     if not tweet_has_mlb_context(text, handle):
         print(f"  🚫 @{handle}: no MLB context — {text[:60]}")
+        post_drop_log(handle, "no MLB context", text)
         return
 
     pinch_hitter, replaced = extract_players(text)
     if not pinch_hitter or not replaced:
         print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
+        post_drop_log(handle, f"name extraction failed (ph={pinch_hitter} out={replaced})", text)
         return
 
     is_reporter = handle in REPORTER_HANDLES
@@ -935,10 +960,12 @@ def handle_tweet(tid, text, handle):
     # For general accounts, both names must be in today's rosters
     if not is_reporter and (not is_todays_player(pinch_hitter) or not is_todays_player(replaced)):
         print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's rosters")
+        post_drop_log(handle, f"roster miss: {pinch_hitter} / {replaced}", text)
         return
 
     if is_player_on_cooldown(pinch_hitter):
         print(f"  🔇 '{pinch_hitter}' on cooldown")
+        post_drop_log(handle, f"cooldown: {pinch_hitter}", text)
         return
     reporter    = REPORTER_BY_HANDLE.get(handle)
     team        = reporter["team"] if reporter else None
@@ -1110,7 +1137,7 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v12.0")
+    print("⚾ MLB Pinch Hit Bot v13.0")
     print("   ✅ Reporter bypass — beat reporters skip roster check entirely")
     print("   ✅ Suffix stripping — Jr./Sr./III no longer cause mismatches")
     print("   ✅ Richer name index — first, last, full, first+last all indexed")
@@ -1129,6 +1156,8 @@ def run():
         print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies will be skipped")
     if not ANTHROPIC_API_KEY:
         print("[warning] ANTHROPIC_API_KEY not set — AI clarifier will be skipped")
+    if not DISCORD_LOG_WEBHOOK:
+        print("[warning] DISCORD_LOG_WEBHOOK_URL not set — drop logging will be skipped")
 
     start_lineup_refresh_thread()
     prefetch_full_rosters()
