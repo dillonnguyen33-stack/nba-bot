@@ -1,12 +1,10 @@
 """
-MLB Pinch Hit Alert Bot - v11.0
-Changes from v10.0:
-1. Suffix stripping — "Tatis Jr." → "tatis", fixes Jr./Sr./III mismatches
-2. Richer name index — first name, last name, full name, first+last variants all indexed
-3. Fuzzy match — 1-char typo tolerance for names 5+ chars (tweet typos no longer miss)
-4. Context pre-check — tweet must mention MLB team OR come from known reporter
-   before name matching runs (replaces college/softball noise without removing roster check)
-5. Fixed lineup refresh loop — was refreshing every 30s, now correctly every 5 min
+MLB Pinch Hit Alert Bot - v12.0
+Changes from v11.0:
+1. Reporter bypass — verified beat reporters skip roster check entirely
+   (reporters are trusted; roster check was silently killing valid alerts)
+All v11.0 changes preserved:
+- Suffix stripping, richer name index, fuzzy match, MLB context gate, lineup refresh fix
 """
 
 import os
@@ -931,15 +929,17 @@ def handle_tweet(tid, text, handle):
         print(f"  🚫 @{handle}: need both names — ph={pinch_hitter} out={replaced}")
         return
 
-    if not is_todays_player(pinch_hitter) or not is_todays_player(replaced):
+    is_reporter = handle in REPORTER_HANDLES
+
+    # Reporters are trusted — skip roster check entirely
+    # For general accounts, both names must be in today's rosters
+    if not is_reporter and (not is_todays_player(pinch_hitter) or not is_todays_player(replaced)):
         print(f"  🚫 @{handle}: '{pinch_hitter}' or '{replaced}' not in today's rosters")
         return
 
     if is_player_on_cooldown(pinch_hitter):
         print(f"  🔇 '{pinch_hitter}' on cooldown")
         return
-
-    is_reporter = handle in REPORTER_HANDLES
     reporter    = REPORTER_BY_HANDLE.get(handle)
     team        = reporter["team"] if reporter else None
     if not team:
@@ -1110,7 +1110,8 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v11.0")
+    print("⚾ MLB Pinch Hit Bot v12.0")
+    print("   ✅ Reporter bypass — beat reporters skip roster check entirely")
     print("   ✅ Suffix stripping — Jr./Sr./III no longer cause mismatches")
     print("   ✅ Richer name index — first, last, full, first+last all indexed")
     print("   ✅ Fuzzy match — 1-char typo tolerance for names 5+ chars")
