@@ -1,34 +1,13 @@
 """
-MLB Pinch Hit Alert Bot - v14.0
+MLB Pinch Hit Alert Bot - v15.0
 
-Root-cause fixes from v13.0 analysis:
-
-PROBLEM 1 — Regex extracting "to", "him", "was", "ill most definitely" as player names
-  FIX: All regex patterns now require names to be Title-Cased proper nouns (capital first
-       letter). Added a hard STOP_NAMES blocklist of pronouns/articles/stopwords. Names
-       must be 2+ chars and pass the proper-noun check before being accepted.
-
-PROBLEM 2 — MLB context gate ran BEFORE name extraction, killing valid tweets like
-  "@a_jude: Brendan Donovan has come on deck to pinch hit for Cal Raleigh" (no team
-  mentioned, but two real MLB players). Context gate dropped it before roster lookup.
-  FIX: Pipeline reordered. Name extraction runs first. If both names extract cleanly,
-       roster lookup IS the context check. MLB context gate is now a fallback for when
-       name extraction fails but a core phrase is present.
-
-PROBLEM 3 — Claude clarifier called only as a post-hoc confirm AFTER the alert fired.
-  When regex fails on complex sentence structure, Claude now acts as the NAME EXTRACTOR,
-  not just a yes/no classifier. New two-stage Claude call:
-    Stage A (fast, sync-ish): extract pinch_hitter + replaced from the raw tweet text
-    Stage B (existing): confirm it's a pre-event alert
-  This catches: "Brendan Donovan, who is taking over at third base, was on deck to
-  pinch-hit for him" — regex fails, Claude reads it and returns the real names.
-
-PROBLEM 4 — Reporter tweets bypassed roster check but NOT name extraction, so bad
-  parses like "was" / "him" fired as real alerts.
-  FIX: Reporters now also go through Claude name extraction when regex returns garbage
-       (either name fails the proper-noun check or is in the STOP_NAMES list).
-
-All v13.0 features preserved.
+Fix from v14.0:
+PROBLEM — Roster gate used `and` logic: only dropped if BOTH names missed.
+  "Anthony Holloway" fuzzy-matched a real player, "Rowen Lee" missed,
+  but the alert still fired because at least one resolved.
+  FIX: Changed to `or` logic — BOTH names must resolve to an MLB roster entry.
+  If either name misses, the alert is dropped. High school / non-MLB tweets
+  are killed because the fake player name won't match anyone on the roster.
 """
 
 import os
@@ -63,36 +42,22 @@ def strip_suffix(name):
     return _SUFFIXES.sub('', normalize(name)).strip()
 
 # ── STOP NAMES — words that look like names but never are ────────────────────
-# These are the words the old regex was grabbing as "player names".
 STOP_NAMES = {
-    # pronouns
     "he", "him", "his", "they", "them", "their", "i", "me", "my",
     "she", "her", "we", "us", "our", "you", "your", "it", "its",
-    # articles / determiners
     "the", "a", "an", "this", "that", "these", "those",
-    # common verbs / aux that start sentences
     "was", "is", "are", "were", "has", "have", "had", "be", "been",
     "will", "would", "could", "should", "may", "might", "must", "do",
     "did", "does", "get", "got", "got", "let", "say", "said",
-    # prepositions / conjunctions
     "to", "for", "in", "on", "at", "by", "of", "with", "from",
     "and", "but", "or", "if", "so", "yet", "nor",
-    # adverbs / adjectives that appear in tweets
     "just", "still", "already", "also", "even", "then", "now",
     "not", "no", "never", "always", "probably", "definitely",
     "most", "more", "very", "really", "ill", "well",
-    # filler phrases that leak through
     "lol", "wtf", "omg", "smh", "ffs", "ngl",
 }
 
 def _is_valid_name_token(word):
-    """
-    A name token must:
-    - Start with an uppercase letter (proper noun)
-    - Be at least 2 characters
-    - Not be in the STOP_NAMES blocklist (including contraction base: He'll → he)
-    - Not be a pure digit string
-    """
     if not word:
         return False
     if len(word) < 2:
@@ -104,32 +69,23 @@ def _is_valid_name_token(word):
     w_lower = word.lower()
     if w_lower in STOP_NAMES:
         return False
-    # Reject contractions like He'll, She'd, They'll — strip apostrophe suffix and check base
     base = re.split(r"'", w_lower)[0]
     if base in STOP_NAMES:
         return False
     return True
 
 def _validate_name(name):
-    """
-    Validate an extracted name string.
-    All tokens must pass _is_valid_name_token.
-    Returns cleaned name or None.
-    """
     if not name:
         return None
-    # Strip trailing punctuation
     name = name.strip(" .,;:'\"")
     parts = name.split()
     if not parts:
         return None
-    # Every word must be a valid name token
     if not all(_is_valid_name_token(p.rstrip(".,;:'\"")) for p in parts):
         return None
-    # Single-word name: allow ALL-CAPS initials (MJ, JD, AJ) or 3+ char words
     if len(parts) == 1:
         if parts[0].isupper() and len(parts[0]) >= 2:
-            return " ".join(parts)  # initials like MJ
+            return " ".join(parts)
         if len(parts[0]) < 3:
             return None
     return " ".join(parts)
@@ -548,11 +504,6 @@ def infer_team_from_text(text):
 
 # ── CONTEXT PRE-CHECK (now only used when name extraction fails) ──────────────
 def tweet_has_mlb_context(text, handle):
-    """
-    Lightweight MLB context check used as a fallback gate when
-    name extraction fails and we're deciding whether to even call Claude.
-    Reporters always pass. Others need a team/city name mention.
-    """
     if handle.lower() in REPORTER_HANDLES:
         return True
     tl = normalize(text)
@@ -617,67 +568,36 @@ def has_reject_phrase(text):
     return False, None
 
 # ── NAME EXTRACTION ───────────────────────────────────────────────────────────
-# KEY CHANGE: patterns now use [A-Z] anchor to require proper-noun capitalization.
-# This stops "to", "him", "was", "ill most definitely" from matching as names.
-
 def preprocess_text(text):
-    # Remove parentheticals first
     text = re.sub(r"\([^)]+\)", "", text)
-    # Remove trailing ", who ..." clauses (e.g. "Cal Raleigh, who looked in discomfort...")
     text = re.sub(r",\s+who\s+[^,.]+[,.]?", " ", text, flags=re.IGNORECASE)
-    # Remove embedded ", who is/was X," relative clauses
     text = re.sub(r",?\s+who\s+[^,]+,", " ", text, flags=re.IGNORECASE)
-    # Remove "in the Nth inning" trailing phrases
     text = re.sub(r"\s+in\s+the\s+\w+\s+inning.*$", "", text, flags=re.IGNORECASE)
-    # Remove hashtags (they sometimes have team names that confuse extraction)
     text = re.sub(r"#\w+", "", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip().lstrip(",").strip()
 
-# Proper-noun name: must start uppercase, 2+ chars, allows hyphens/apostrophes
 PN = r"([A-Z][A-Za-z'\-]{1,}(?:\s+[A-Z][A-Za-z'\-]{1,})*)"
 
 def _try_patterns(clean):
-    """
-    Try all regex patterns. Returns (pinch_hitter, replaced) raw strings or (None, None).
-    Patterns are ordered most-specific first.
-    """
     patterns = [
-        # "X will be on deck to pinch-hit for Y"
         PN + r'\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        # "X will pinch-hit for Y"
         PN + r'\s+will\s+pinch[- ]hit(?:ting)?\s+for\s+' + PN,
-        # "X has come on deck to pinch-hit for Y" (e.g. "Brendan Donovan has come on deck...")
         PN + r'\s+has\s+come\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        # "X is on deck / is out on deck to pinch-hit for Y"
         PN + r'\s+(?:is\s+)?(?:out\s+)?on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        # "X is pinch-hitting for Y"
         PN + r'\s+(?:is\s+)?pinch[- ]hit(?:ting)?\s+for\s+' + PN,
-        # "X slated to pinch-hit for Y"
         PN + r'\s+slated\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        # "X to pinch-hit for Y" (e.g. "Jones to pinch hit for Keith", "using Valenzuela to pinch hit for Sosa")
         PN + r'\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        # "X will ph for Y" / "X will be ph for Y"
         PN + r'\s+will\s+(?:be\s+)?ph\s+for\s+' + PN,
-        # "X is on deck to ph for Y"
         PN + r'\s+(?:is\s+)?on\s+deck\s+to\s+ph\s+for\s+' + PN,
-        # "X phing for Y"
         PN + r'\s+ph(?:ing)?\s+for\s+' + PN,
-        # "Y is getting pinch-hit for by X" (reversed order)
         PN + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + PN,
-        # "X sent up (to hit) for Y"
         PN + r'\s+sent\s+up\s+(?:to\s+hit\s+)?for\s+' + PN,
-        # "X hitting in place of Y"
         PN + r'\s+hitting\s+in\s+place\s+of\s+' + PN,
-        # "X batting for Y"
         PN + r'\s+batting\s+for\s+' + PN,
-        # "X up to hit for Y"
         PN + r'\s+(?:is\s+)?up\s+to\s+hit\s+for\s+' + PN,
-        # "X in to hit for Y"
         PN + r'\s+in\s+to\s+hit\s+for\s+' + PN,
-        # "X called upon to hit for Y"
         PN + r'\s+called\s+upon\s+to\s+hit\s+for\s+' + PN,
-        # "X coming up to hit for Y"
         PN + r'\s+coming\s+up\s+to\s+hit\s+for\s+' + PN,
     ]
     for p in patterns:
@@ -687,16 +607,10 @@ def _try_patterns(clean):
     return None, None
 
 def extract_players(text):
-    """
-    Extract (pinch_hitter, replaced) from tweet text.
-    Returns (None, None) if extraction fails or produces invalid names.
-    """
     clean = preprocess_text(strip_mentions(text))
     raw_ph, raw_out = _try_patterns(clean)
-
     ph  = _validate_name(raw_ph)
     out = _validate_name(raw_out)
-
     return ph, out
 
 # ── CLAUDE AI — NAME EXTRACTOR + CLASSIFIER ───────────────────────────────────
@@ -729,11 +643,6 @@ Extract real player names even from complex sentences. Examples:
 For is_valid=true, both pinch_hitter and replaced must be non-null real player names."""
 
 def claude_extract_and_classify(tweet_text, callback):
-    """
-    Single Claude call that both extracts names AND classifies validity.
-    callback(is_valid, pinch_hitter, replaced, reason)
-    Runs in a background thread.
-    """
     if not ANTHROPIC_API_KEY:
         callback(False, None, None, "No API key")
         return
@@ -757,7 +666,6 @@ def claude_extract_and_classify(tweet_text, callback):
             )
             r.raise_for_status()
             raw = r.json()["content"][0]["text"].strip()
-            # Strip markdown fences if present
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"```\s*$", "", raw)
             data = json.loads(raw)
@@ -959,22 +867,21 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
 def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
     """
     Final stage: roster check (for non-reporters), cooldown, team lookup, fire.
-    Called after we have validated names from either regex or Claude.
+    v15 FIX: BOTH names must resolve to an MLB roster entry (changed `and` to `or`).
     """
     is_reporter = handle in REPORTER_HANDLES
 
-    # For non-reporters: both names must resolve to MLB rosters
+    # For non-reporters: BOTH names must resolve to MLB rosters
     if not is_reporter:
         ph_team  = lookup_player_team(pinch_hitter)
         out_team = lookup_player_team(replaced)
-        if not ph_team and not out_team:
-            print(f"  🚫 @{handle}: neither '{pinch_hitter}' nor '{replaced}' in rosters"
+        if not ph_team or not out_team:
+            missing = []
+            if not ph_team:  missing.append(pinch_hitter)
+            if not out_team: missing.append(replaced)
+            print(f"  🚫 @{handle}: roster miss for {missing}"
                   f"{' [via Claude]' if via_claude else ''}")
-            post_drop_log(handle, f"roster miss: {pinch_hitter} / {replaced}", text)
-            return
-        # At least one must resolve; accept if either is found
-        if not ph_team and not out_team:
-            post_drop_log(handle, f"roster miss: {pinch_hitter} / {replaced}", text)
+            post_drop_log(handle, f"roster miss: {', '.join(missing)}", text)
             return
 
     if is_player_on_cooldown(pinch_hitter):
@@ -1010,21 +917,6 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
 
 
 def handle_tweet(tid, text, handle):
-    """
-    NEW PIPELINE (v14):
-
-    1. Dedup / game hours check
-    2. Core phrase check (fast discard)
-    3. Reject phrases (past tense, non-MLB signals)
-    4. Question check
-    5. Result-after-ph check
-    6. Try regex name extraction
-       a. If regex succeeds AND both names are valid proper nouns → _fire_alert()
-       b. If regex fails or produces garbage names → try Claude extraction
-          - Claude: if has_mlb_context OR is reporter → send to Claude
-          - Claude result: if valid + real names → _fire_alert()
-          - Claude result: if invalid → drop with Claude's reason
-    """
     maybe_reset_daily()
 
     if not is_game_hours():
@@ -1036,7 +928,6 @@ def handle_tweet(tid, text, handle):
     if not has_core_phrase(text):
         return
 
-    # Fast pre-filters (order matters: cheapest first)
     if is_question(text):
         print(f"  🚫 @{handle}: question/speculation — {text[:60]}")
         post_drop_log(handle, "question/speculation", text)
@@ -1057,16 +948,13 @@ def handle_tweet(tid, text, handle):
     pinch_hitter, replaced = extract_players(text)
 
     if pinch_hitter and replaced:
-        # Regex succeeded with valid proper nouns — fast path
         print(f"  📝 Regex extracted: ph='{pinch_hitter}' out='{replaced}' from @{handle}")
         _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False)
         return
 
     # ── Stage 2: Regex failed — try Claude ───────────────────────────────────
-    # Only send to Claude if there's some reason to believe this is MLB
     is_reporter = handle in REPORTER_HANDLES
     if not is_reporter and not tweet_has_mlb_context(text, handle):
-        # No team/city mention, not a reporter, regex failed → safe to drop
         print(f"  🚫 @{handle}: regex failed + no MLB context — {text[:60]}")
         post_drop_log(handle, "regex failed, no MLB context", text)
         return
@@ -1078,7 +966,6 @@ def handle_tweet(tid, text, handle):
 
     print(f"  🤖 Regex failed for @{handle} — sending to Claude: {text[:80]}")
 
-    # Claude runs async; capture tid/handle/text in closure
     _tid     = tid
     _text    = text
     _handle  = handle
@@ -1242,12 +1129,12 @@ def poll_reporters_forever(user_ids):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v14.0")
+    print("⚾ MLB Pinch Hit Bot v15.0")
     print("   ✅ Fix 1: Regex requires Title-Case proper nouns — no more 'to'/'him'/'was' as names")
     print("   ✅ Fix 2: Claude now extracts names when regex fails (not just yes/no confirm)")
     print("   ✅ Fix 3: MLB context gate moved AFTER regex — player names ARE the context proof")
     print("   ✅ Fix 4: Reporter tweets go through Claude name check too (no more 'was'/'him' alerts)")
-    print("   ✅ Fix 5: Roster check relaxed — fire if EITHER name resolves (handles last-name-only)")
+    print("   ✅ Fix 5: BOTH names must resolve to MLB roster — no more high school tweets firing")
     print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
