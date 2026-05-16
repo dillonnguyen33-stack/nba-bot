@@ -1,13 +1,14 @@
 """
-MLB Pinch Hit Alert Bot - v15.0
+MLB Pinch Hit Alert Bot — v16.0
 
-Fix from v14.0:
-PROBLEM — Roster gate used `and` logic: only dropped if BOTH names missed.
-  "Anthony Holloway" fuzzy-matched a real player, "Rowen Lee" missed,
-  but the alert still fired because at least one resolved.
-  FIX: Changed to `or` logic — BOTH names must resolve to an MLB roster entry.
-  If either name misses, the alert is dropped. High school / non-MLB tweets
-  are killed because the fake player name won't match anyone on the roster.
+Changes from v15.0:
+- REMOVED: Reporter poller (stream catches them anyway, poller was burning credits)
+- REMOVED: Regex name extraction (Claude handles all extraction, more accurate)
+- REMOVED: MLB context pre-check (Claude does this better)
+- KEPT:    Cheap string pre-filters (reject phrases, question check, result-after-ph)
+- KEPT:    Roster gate for non-reporters (still validates extracted names)
+- KEPT:    Reporter trust system (beat reporters get green alert, others yellow)
+- RESULT:  Simpler pipeline, lower API cost, fewer missed alerts
 """
 
 import os
@@ -40,107 +41,6 @@ _SUFFIXES = re.compile(r'\b(jr\.?|sr\.?|ii|iii|iv)\s*$', re.IGNORECASE)
 
 def strip_suffix(name):
     return _SUFFIXES.sub('', normalize(name)).strip()
-
-# ── STOP NAMES — words that look like names but never are ────────────────────
-STOP_NAMES = {
-    "he", "him", "his", "they", "them", "their", "i", "me", "my",
-    "she", "her", "we", "us", "our", "you", "your", "it", "its",
-    "the", "a", "an", "this", "that", "these", "those",
-    "was", "is", "are", "were", "has", "have", "had", "be", "been",
-    "will", "would", "could", "should", "may", "might", "must", "do",
-    "did", "does", "get", "got", "got", "let", "say", "said",
-    "to", "for", "in", "on", "at", "by", "of", "with", "from",
-    "and", "but", "or", "if", "so", "yet", "nor",
-    "just", "still", "already", "also", "even", "then", "now",
-    "not", "no", "never", "always", "probably", "definitely",
-    "most", "more", "very", "really", "ill", "well",
-    "lol", "wtf", "omg", "smh", "ffs", "ngl",
-}
-
-def _is_valid_name_token(word):
-    if not word:
-        return False
-    if len(word) < 2:
-        return False
-    if not word[0].isupper():
-        return False
-    if word.isdigit():
-        return False
-    w_lower = word.lower()
-    if w_lower in STOP_NAMES:
-        return False
-    base = re.split(r"'", w_lower)[0]
-    if base in STOP_NAMES:
-        return False
-    return True
-
-def _validate_name(name):
-    if not name:
-        return None
-    name = name.strip(" .,;:'\"")
-    parts = name.split()
-    if not parts:
-        return None
-    if not all(_is_valid_name_token(p.rstrip(".,;:'\"")) for p in parts):
-        return None
-    if len(parts) == 1:
-        if parts[0].isupper() and len(parts[0]) >= 2:
-            return " ".join(parts)
-        if len(parts[0]) < 3:
-            return None
-    return " ".join(parts)
-
-# ── NAME INDEX ────────────────────────────────────────────────────────────────
-_name_index = {}
-_name_lock  = threading.Lock()
-
-def _index_player(full_name, team_name, target=None):
-    if not full_name:
-        return
-    d     = target if target is not None else _name_index
-    norm  = strip_suffix(full_name)
-    parts = norm.split()
-    if not parts:
-        return
-    d[norm] = team_name
-    if len(parts) >= 2:
-        d[parts[0] + " " + parts[-1]] = team_name
-    if len(parts[-1]) >= 3:
-        d["_last_" + parts[-1]] = team_name
-    if len(parts[0]) >= 5:
-        d["_first_" + parts[0]] = team_name
-
-def rebuild_index(new_entries):
-    with _name_lock:
-        _name_index.update(new_entries)
-
-# ── FUZZY MATCH ───────────────────────────────────────────────────────────────
-def _levenshtein(a, b):
-    if abs(len(a) - len(b)) > 1:
-        return 2
-    if a == b:
-        return 0
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            curr.append(min(prev[j] + (ca != cb), prev[j+1] + 1, curr[j] + 1))
-        prev = curr
-    return prev[-1]
-
-def _fuzzy_lookup(key, index):
-    if key in index:
-        return index[key]
-    if len(key) < 5:
-        return None
-    for ikey, team in index.items():
-        if ikey.startswith("_"):
-            continue
-        if abs(len(ikey) - len(key)) > 1:
-            continue
-        if _levenshtein(key, ikey) == 1:
-            return team
-    return None
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -237,19 +137,22 @@ TEAM_ALIASES = {
     "giants": "Giants", "san francisco": "Giants",
 }
 
-# ── PHRASES ───────────────────────────────────────────────────────────────────
-CORE_PHRASES = [
-    "pinch hit for", "pinch-hit for",
-    "on deck to pinch hit", "slated to pinch hit",
-    "will pinch hit", "pinch hitting for", "pinch-hitting for",
-    "will ph for", "will be ph for", "on deck to ph",
-    "ph for", "phing for",
-    "sent up to hit for", "sent up for",
-    "hitting in place of", "batting for",
-    "up to hit for", "in to hit for",
-    "called upon to hit for", "coming up to hit for",
+# ── STREAM RULES ──────────────────────────────────────────────────────────────
+STREAM_RULES = [
+    {"value": '"pinch hit for" -is:retweet lang:en',          "tag": "pinch_hit_for"},
+    {"value": '"pinch-hit for" -is:retweet lang:en',          "tag": "pinch_hit_for_hyph"},
+    {"value": '"on deck to pinch hit" -is:retweet lang:en',   "tag": "on_deck"},
+    {"value": '"slated to pinch hit" -is:retweet lang:en',    "tag": "slated"},
+    {"value": '"will pinch hit" -is:retweet lang:en',         "tag": "will_ph"},
+    {"value": '"will ph for" -is:retweet lang:en',            "tag": "will_ph_abbrev"},
+    {"value": '"on deck to ph" -is:retweet lang:en',          "tag": "on_deck_ph_abbrev"},
+    {"value": '"sent up to hit for" -is:retweet lang:en',     "tag": "sent_up"},
+    {"value": '"hitting in place of" -is:retweet lang:en',    "tag": "in_place_of"},
+    {"value": '"sent up for" -is:retweet lang:en',            "tag": "sent_up_short"},
+    {"value": '"called upon to hit for" -is:retweet lang:en', "tag": "called_upon"},
 ]
 
+# ── CHEAP STRING PRE-FILTERS (run before Claude to save API calls) ────────────
 REJECT_PHRASES = [
     "last night", "yesterday",
     "college", "university", "high school", "ncaa",
@@ -268,29 +171,67 @@ REJECT_PHRASES = [
     "pinched",
 ]
 
-STREAM_RULES = [
-    {"value": '"pinch hit for" -is:retweet lang:en',          "tag": "pinch_hit_for"},
-    {"value": '"pinch-hit for" -is:retweet lang:en',          "tag": "pinch_hit_for_hyph"},
-    {"value": '"on deck to pinch hit" -is:retweet lang:en',   "tag": "on_deck"},
-    {"value": '"slated to pinch hit" -is:retweet lang:en',    "tag": "slated"},
-    {"value": '"will pinch hit" -is:retweet lang:en',         "tag": "will_ph"},
-    {"value": '"will ph for" -is:retweet lang:en',            "tag": "will_ph_abbrev"},
-    {"value": '"on deck to ph" -is:retweet lang:en',          "tag": "on_deck_ph_abbrev"},
-    {"value": '"sent up to hit for" -is:retweet lang:en',     "tag": "sent_up"},
-    {"value": '"hitting in place of" -is:retweet lang:en',    "tag": "in_place_of"},
-    {"value": '"sent up for" -is:retweet lang:en',            "tag": "sent_up_short"},
-    {"value": '"called upon to hit for" -is:retweet lang:en', "tag": "called_upon"},
+RESULT_WORDS = [
+    "home run", "homerun", "homered", "homer",
+    "singled", "doubled", "tripled",
+    "struck out", "strikeout", "walked", "grounded out", "flied out", "lined out",
+    "drove in", "rbi", "scored",
 ]
 
+PINCH_HIT_PHRASES_LOWER = [
+    "pinch hit for", "pinch-hit for",
+    "pinch hitting for", "pinch-hitting for",
+    "will pinch hit", "will ph for", "ph for", "phing for",
+    "on deck to pinch hit", "slated to pinch hit",
+    "will be ph for", "on deck to ph",
+    "sent up to hit for", "sent up for",
+    "hitting in place of", "batting for",
+    "up to hit for", "in to hit for",
+    "called upon to hit for", "coming up to hit for",
+]
+
+def has_core_phrase(text):
+    tl = normalize(text)
+    return any(phrase in tl for phrase in PINCH_HIT_PHRASES_LOWER)
+
+def has_reject_phrase(text):
+    tl = normalize(text)
+    for phrase in REJECT_PHRASES:
+        if phrase in tl:
+            return True, phrase
+    return False, None
+
+def is_question(text):
+    stripped = text.strip()
+    if re.search(r"\?[\s\W]*$", stripped):
+        return True
+    if re.match(r"(did|does|would|should|could|can)\b", stripped.lower()):
+        return True
+    return False
+
+def result_comes_after_ph(text):
+    tl = normalize(text)
+    ph_pos = -1
+    for phrase in PINCH_HIT_PHRASES_LOWER:
+        pos = tl.find(phrase)
+        if pos != -1 and (ph_pos == -1 or pos < ph_pos):
+            ph_pos = pos
+    if ph_pos == -1:
+        return False
+    after_text = tl[ph_pos:]
+    return any(word in after_text for word in RESULT_WORDS)
+
 # ── STATE ─────────────────────────────────────────────────────────────────────
-seen_tweet_ids      = set()
-posted_alert_keys   = set()
-last_reset_date     = None
-player_alert_count  = {}
-player_alert_time   = {}
-daily_lineup_map    = {}
+seen_tweet_ids     = set()
+posted_alert_keys  = set()
+last_reset_date    = None
+player_alert_count = {}
+player_alert_time  = {}
+daily_lineup_map   = {}
 last_lineup_refresh = 0
-_lineup_lock        = threading.Lock()
+_name_index        = {}
+_name_lock         = threading.Lock()
+_lineup_lock       = threading.Lock()
 
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
@@ -338,7 +279,7 @@ def record_player_alert(name):
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
 
-# ── ROSTER / LINEUP MAP ───────────────────────────────────────────────────────
+# ── ROSTER / NAME INDEX ───────────────────────────────────────────────────────
 def _add_player_to_map(target_map, full_name, team_name):
     if not full_name:
         return
@@ -352,105 +293,37 @@ def _add_player_to_map(target_map, full_name, team_name):
     if len(parts) >= 1 and len(parts[0]) >= 5:
         target_map["_first_" + parts[0]] = team_name
 
-def prefetch_full_rosters():
-    def _run():
-        try:
-            teams_r = requests.get(
-                "https://statsapi.mlb.com/api/v1/teams",
-                params={"sportId": 1}, timeout=10
-            )
-            teams_r.raise_for_status()
-            team_ids = [t["id"] for t in teams_r.json().get("teams", [])]
-        except Exception as e:
-            print(f"[roster] Teams fetch error: {e}")
-            return
+def rebuild_index(new_entries):
+    with _name_lock:
+        _name_index.update(new_entries)
 
-        new_entries = {}
-        for tid in team_ids:
-            try:
-                r = requests.get(
-                    f"https://statsapi.mlb.com/api/v1/teams/{tid}/roster",
-                    params={"rosterType": "active"}, timeout=10
-                )
-                r.raise_for_status()
-                for p in r.json().get("roster", []):
-                    full      = p.get("person", {}).get("fullName", "")
-                    team_name = p.get("team", {}).get("name", "Unknown")
-                    _add_player_to_map(new_entries, full, team_name)
-            except Exception as e:
-                print(f"[roster] Team {tid} error: {e}")
+def _levenshtein(a, b):
+    if abs(len(a) - len(b)) > 1:
+        return 2
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j] + (ca != cb), prev[j+1] + 1, curr[j] + 1))
+        prev = curr
+    return prev[-1]
 
-        with _lineup_lock:
-            daily_lineup_map.update(new_entries)
-        rebuild_index(new_entries)
-        print(f"[roster] Full rosters loaded — {len(new_entries)} entries added\n")
+def _fuzzy_lookup(key, index):
+    if key in index:
+        return index[key]
+    if len(key) < 5:
+        return None
+    for ikey, team in index.items():
+        if ikey.startswith("_"):
+            continue
+        if abs(len(ikey) - len(key)) > 1:
+            continue
+        if _levenshtein(key, ikey) == 1:
+            return team
+    return None
 
-    threading.Thread(target=_run, daemon=True).start()
-
-def _do_lineup_refresh():
-    global daily_lineup_map, last_lineup_refresh
-    print("[lineup] Refreshing today's MLB lineups...")
-    new_map = {}
-
-    try:
-        today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
-        sched = requests.get(
-            "https://statsapi.mlb.com/api/v1/schedule",
-            params={"sportId": 1, "date": today_str, "gameType": "R",
-                    "hydrate": "roster,lineups"},
-            timeout=10
-        )
-        sched.raise_for_status()
-        game_pks = [
-            g["gamePk"]
-            for d in sched.json().get("dates", [])
-            for g in d.get("games", [])
-        ]
-    except Exception as e:
-        print(f"[lineup] Schedule error: {e}")
-        return
-
-    for game_pk in game_pks:
-        try:
-            r = requests.get(
-                f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
-                timeout=10
-            )
-            r.raise_for_status()
-            boxscore = r.json().get("liveData", {}).get("boxscore", {})
-            for side in ["home", "away"]:
-                team_data = boxscore.get("teams", {}).get(side, {})
-                team_name = team_data.get("team", {}).get("name", "")
-                team_mapped = None
-                for alias, mapped in TEAM_ALIASES.items():
-                    if alias in team_name.lower():
-                        team_mapped = mapped
-                        break
-                for pid, pdata in team_data.get("players", {}).items():
-                    full = pdata.get("person", {}).get("fullName", "")
-                    team = team_mapped or team_name
-                    _add_player_to_map(new_map, full, team)
-        except Exception as e:
-            print(f"[lineup] Game {game_pk} error: {e}")
-
-    with _lineup_lock:
-        daily_lineup_map.update(new_map)
-        last_lineup_refresh = time.time()
-    rebuild_index(new_map)
-    print(f"[lineup] {len([k for k in new_map if not k.startswith('_')])} players loaded\n")
-
-def start_lineup_refresh_thread():
-    def loop():
-        while True:
-            try:
-                _do_lineup_refresh()
-            except Exception as e:
-                print(f"[lineup] Refresh error: {e}")
-            time.sleep(LINEUP_REFRESH_SECS)
-    threading.Thread(target=loop, daemon=True).start()
-    print("[lineup] Background refresh thread started (every 5 min)\n")
-
-# ── PLAYER LOOKUP ─────────────────────────────────────────────────────────────
 def _resolve_name(name):
     if not name:
         return None
@@ -483,9 +356,6 @@ def _resolve_name(name):
             return result
     return None
 
-def is_todays_player(name):
-    return _resolve_name(name) is not None
-
 def lookup_player_team(name):
     return _resolve_name(name)
 
@@ -494,127 +364,109 @@ def infer_team_from_text(text):
     for alias, team in TEAM_ALIASES.items():
         if alias in tl:
             return team
-    words = text.split()
-    with _name_lock:
-        for i in range(len(words) - 1):
-            two = strip_suffix(words[i] + " " + words[i+1])
-            if two in _name_index:
-                return _name_index[two]
     return None
 
-# ── CONTEXT PRE-CHECK (now only used when name extraction fails) ──────────────
-def tweet_has_mlb_context(text, handle):
-    if handle.lower() in REPORTER_HANDLES:
-        return True
-    tl = normalize(text)
-    for alias in TEAM_ALIASES:
-        if alias in tl:
-            return True
-    return False
+# ── ROSTER PREFETCH ───────────────────────────────────────────────────────────
+def prefetch_full_rosters():
+    def _run():
+        try:
+            teams_r = requests.get(
+                "https://statsapi.mlb.com/api/v1/teams",
+                params={"sportId": 1}, timeout=10
+            )
+            teams_r.raise_for_status()
+            team_ids = [t["id"] for t in teams_r.json().get("teams", [])]
+        except Exception as e:
+            print(f"[roster] Teams fetch error: {e}")
+            return
 
-# ── DETECTION HELPERS ─────────────────────────────────────────────────────────
-def strip_mentions(text):
-    return re.sub(r'@\w+', '', text)
+        new_entries = {}
+        for tid in team_ids:
+            try:
+                r = requests.get(
+                    f"https://statsapi.mlb.com/api/v1/teams/{tid}/roster",
+                    params={"rosterType": "active"}, timeout=10
+                )
+                r.raise_for_status()
+                for p in r.json().get("roster", []):
+                    full      = p.get("person", {}).get("fullName", "")
+                    team_name = p.get("team", {}).get("name", "Unknown")
+                    _add_player_to_map(new_entries, full, team_name)
+            except Exception as e:
+                print(f"[roster] Team {tid} error: {e}")
 
-def has_core_phrase(text):
-    tl = normalize(text)
-    return any(phrase in tl for phrase in CORE_PHRASES)
+        with _lineup_lock:
+            daily_lineup_map.update(new_entries)
+        rebuild_index(new_entries)
+        print(f"[roster] Full rosters loaded — {len(new_entries)} entries\n")
 
-RESULT_WORDS = [
-    "home run", "homerun", "homered", "homer",
-    "singled", "doubled", "tripled",
-    "struck out", "strikeout", "walked", "grounded out", "flied out", "lined out",
-    "drove in", "rbi", "scored",
-]
+    threading.Thread(target=_run, daemon=True).start()
 
-PINCH_HIT_PHRASES_LOWER = [
-    "pinch hit for", "pinch-hit for",
-    "pinch hitting for", "pinch-hitting for",
-    "will pinch hit", "will ph for", "ph for", "phing for",
-    "on deck to pinch hit", "slated to pinch hit",
-    "will be ph for", "on deck to ph",
-    "sent up to hit for", "sent up for",
-    "hitting in place of", "batting for",
-    "up to hit for", "in to hit for",
-    "called upon to hit for", "coming up to hit for",
-]
+def start_lineup_refresh_thread():
+    def _do_refresh():
+        global last_lineup_refresh
+        print("[lineup] Refreshing today's MLB lineups...")
+        new_map = {}
+        try:
+            today_str = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+            sched = requests.get(
+                "https://statsapi.mlb.com/api/v1/schedule",
+                params={"sportId": 1, "date": today_str, "gameType": "R",
+                        "hydrate": "roster,lineups"},
+                timeout=10
+            )
+            sched.raise_for_status()
+            game_pks = [
+                g["gamePk"]
+                for d in sched.json().get("dates", [])
+                for g in d.get("games", [])
+            ]
+        except Exception as e:
+            print(f"[lineup] Schedule error: {e}")
+            return
 
-def result_comes_after_ph(text):
-    tl = normalize(text)
-    ph_pos = -1
-    for phrase in PINCH_HIT_PHRASES_LOWER:
-        pos = tl.find(phrase)
-        if pos != -1 and (ph_pos == -1 or pos < ph_pos):
-            ph_pos = pos
-    if ph_pos == -1:
-        return False
-    after_text = tl[ph_pos:]
-    return any(word in after_text for word in RESULT_WORDS)
+        for game_pk in game_pks:
+            try:
+                r = requests.get(
+                    f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+                    timeout=10
+                )
+                r.raise_for_status()
+                boxscore = r.json().get("liveData", {}).get("boxscore", {})
+                for side in ["home", "away"]:
+                    team_data = boxscore.get("teams", {}).get(side, {})
+                    team_name = team_data.get("team", {}).get("name", "")
+                    team_mapped = None
+                    for alias, mapped in TEAM_ALIASES.items():
+                        if alias in team_name.lower():
+                            team_mapped = mapped
+                            break
+                    for pid, pdata in team_data.get("players", {}).items():
+                        full = pdata.get("person", {}).get("fullName", "")
+                        team = team_mapped or team_name
+                        _add_player_to_map(new_map, full, team)
+            except Exception as e:
+                print(f"[lineup] Game {game_pk} error: {e}")
 
-def is_question(text):
-    stripped = text.strip()
-    if re.search(r"\?[\s\W]*$", stripped):
-        return True
-    tl = stripped.lower()
-    if re.match(r"(did|does|would|should|could|can)\b", tl):
-        return True
-    return False
+        with _lineup_lock:
+            daily_lineup_map.update(new_map)
+            last_lineup_refresh = time.time()
+        rebuild_index(new_map)
+        print(f"[lineup] {len([k for k in new_map if not k.startswith('_')])} players loaded\n")
 
-def has_reject_phrase(text):
-    tl = normalize(text)
-    for phrase in REJECT_PHRASES:
-        if phrase in tl:
-            return True, phrase
-    return False, None
+    def loop():
+        while True:
+            try:
+                _do_refresh()
+            except Exception as e:
+                print(f"[lineup] Refresh error: {e}")
+            time.sleep(LINEUP_REFRESH_SECS)
 
-# ── NAME EXTRACTION ───────────────────────────────────────────────────────────
-def preprocess_text(text):
-    text = re.sub(r"\([^)]+\)", "", text)
-    text = re.sub(r",\s+who\s+[^,.]+[,.]?", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r",?\s+who\s+[^,]+,", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+in\s+the\s+\w+\s+inning.*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"#\w+", "", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip().lstrip(",").strip()
+    threading.Thread(target=loop, daemon=True).start()
+    print("[lineup] Background refresh thread started (every 5 min)\n")
 
-PN = r"([A-Z][A-Za-z'\-]{1,}(?:\s+[A-Z][A-Za-z'\-]{1,})*)"
-
-def _try_patterns(clean):
-    patterns = [
-        PN + r'\s+will\s+be\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        PN + r'\s+will\s+pinch[- ]hit(?:ting)?\s+for\s+' + PN,
-        PN + r'\s+has\s+come\s+on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        PN + r'\s+(?:is\s+)?(?:out\s+)?on\s+deck\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        PN + r'\s+(?:is\s+)?pinch[- ]hit(?:ting)?\s+for\s+' + PN,
-        PN + r'\s+slated\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        PN + r'\s+to\s+pinch[- ]hit\s+for\s+' + PN,
-        PN + r'\s+will\s+(?:be\s+)?ph\s+for\s+' + PN,
-        PN + r'\s+(?:is\s+)?on\s+deck\s+to\s+ph\s+for\s+' + PN,
-        PN + r'\s+ph(?:ing)?\s+for\s+' + PN,
-        PN + r'\s+(?:is\s+)?(?:getting\s+)?pinch[- ]hit\s+for\s+by\s+' + PN,
-        PN + r'\s+sent\s+up\s+(?:to\s+hit\s+)?for\s+' + PN,
-        PN + r'\s+hitting\s+in\s+place\s+of\s+' + PN,
-        PN + r'\s+batting\s+for\s+' + PN,
-        PN + r'\s+(?:is\s+)?up\s+to\s+hit\s+for\s+' + PN,
-        PN + r'\s+in\s+to\s+hit\s+for\s+' + PN,
-        PN + r'\s+called\s+upon\s+to\s+hit\s+for\s+' + PN,
-        PN + r'\s+coming\s+up\s+to\s+hit\s+for\s+' + PN,
-    ]
-    for p in patterns:
-        m = re.search(p, clean)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-    return None, None
-
-def extract_players(text):
-    clean = preprocess_text(strip_mentions(text))
-    raw_ph, raw_out = _try_patterns(clean)
-    ph  = _validate_name(raw_ph)
-    out = _validate_name(raw_out)
-    return ph, out
-
-# ── CLAUDE AI — NAME EXTRACTOR + CLASSIFIER ───────────────────────────────────
-CLAUDE_EXTRACT_SYSTEM = """You are an MLB pinch hit alert parser. Extract player names and classify tweets.
+# ── CLAUDE — PRIMARY CLASSIFIER + NAME EXTRACTOR ──────────────────────────────
+CLAUDE_SYSTEM = """You are an MLB pinch hit alert parser. Extract player names and classify tweets.
 
 Given a tweet, respond with ONLY a JSON object (no markdown, no explanation):
 {
@@ -625,24 +477,25 @@ Given a tweet, respond with ONLY a JSON object (no markdown, no explanation):
 }
 
 is_valid = true ONLY if ALL of these are true:
-1. A specific named player is ABOUT TO pinch hit (pre-event, future tense)
+1. A specific named player is ABOUT TO pinch hit (pre-event, imminent or confirmed)
 2. A specific named player is being replaced (named or clearly identified)
-3. This is an MLB game (not college, minor league, softball, non-baseball usage)
+3. This is an MLB game (not college, minor league, high school, softball, or non-baseball usage)
 4. The at-bat has NOT happened yet (no past-tense results like singled, homered, struck out)
-5. It is not a question, speculation, or hypothetical
+5. It is not a question, speculation, fan demand, or hypothetical
 
-Extract real player names even from complex sentences. Examples:
-- "Cal Raleigh has exited. Brendan Donovan was on deck to pinch-hit for him." → pinch_hitter: "Brendan Donovan", replaced: "Cal Raleigh"
-- "Casey Schmitt needs to pinch hit for Chapman" → pinch_hitter: "Casey Schmitt", replaced: "Chapman" (is_valid: false — "needs to" is speculation)
-- "Jones will pinch hit for Keith" → pinch_hitter: "Jones", replaced: "Keith"
-- "Valenzuela to pinch hit for Sosa" → pinch_hitter: "Valenzuela", replaced: "Sosa"
-- "He'll pinch hit for Kelenic when a lefty is in" → is_valid: false (hypothetical)
+Extract real player names even from complex sentence structures. Examples:
+- "Brendan Donovan has come on deck to pinch hit for Cal Raleigh" → pinch_hitter: "Brendan Donovan", replaced: "Cal Raleigh", is_valid: true
+- "Casey Schmitt needs to pinch hit for Chapman" → is_valid: false (fan demand, not confirmed)
+- "He'll pinch hit for Kelenic when a lefty is in" → is_valid: false (conditional/hypothetical)
 - "Soto was pinch hit for in the 7th" → is_valid: false (already happened)
 - "Should they pinch hit for him?" → is_valid: false (question)
+- "warming up to pinch hit for Leon" → is_valid: true (imminent pre-event)
+- "Tonight Brian returns to pinch-hit for Laura on the IngrahamAngle" → is_valid: false (not baseball)
+- "pinch hit for Lutterman… #Hokies" → is_valid: false (college baseball)
 
-For is_valid=true, both pinch_hitter and replaced must be non-null real player names."""
+For is_valid=true, both pinch_hitter and replaced must be non-null."""
 
-def claude_extract_and_classify(tweet_text, callback):
+def claude_classify(tweet_text, callback):
     if not ANTHROPIC_API_KEY:
         callback(False, None, None, "No API key")
         return
@@ -657,9 +510,9 @@ def claude_extract_and_classify(tweet_text, callback):
                     "content-type":      "application/json",
                 },
                 json={
-                    "model":      "claude-sonnet-4-20250514",
+                    "model":      "claude-haiku-4-5-20251001",
                     "max_tokens": 150,
-                    "system":     CLAUDE_EXTRACT_SYSTEM,
+                    "system":     CLAUDE_SYSTEM,
                     "messages":   [{"role": "user", "content": f'Tweet: "{tweet_text}"'}],
                 },
                 timeout=15
@@ -676,7 +529,7 @@ def claude_extract_and_classify(tweet_text, callback):
                 data.get("reason", "")
             )
         except Exception as e:
-            print(f"[claude extract] Error: {e}")
+            print(f"[claude] Error: {e}")
             callback(False, None, None, f"Claude error: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
@@ -717,7 +570,7 @@ def post_drop_log(handle, reason, text):
             print(f"[log error] {e}")
     threading.Thread(target=_send, daemon=True).start()
 
-# ── ENRICHMENT (FOLLOW-UP REPLY) ──────────────────────────────────────────────
+# ── ENRICHMENT ────────────────────────────────────────────────────────────────
 def fetch_twitter_user_info(handle):
     try:
         r = requests.get(
@@ -774,13 +627,10 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
     def _run():
         if not DISCORD_CHANNEL_ID:
             return
-
         user_info = fetch_twitter_user_info(handle)
         score, label, reasons = compute_validity_rating(user_info, is_reporter)
-
         lines = [f"**📊 Alert Enrichment — @{handle}**\n"]
         lines.append(f"🏟️ **Teams involved:** {team}")
-
         if user_info:
             lines.append(
                 f"👤 **Account:** "
@@ -790,16 +640,13 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
             )
         else:
             lines.append("👤 **Account:** Could not fetch info")
-
         if is_reporter:
             lines.append(f"🎙️ **Source type:** Official {team} beat reporter")
         else:
             lines.append("🌐 **Source type:** General Twitter user")
-
         lines.append(f"\n**Validity: {score}/10 — {label}**")
         for reason in reasons:
             lines.append(f"  {reason}")
-
         payload = {
             "content": "\n".join(lines),
             "message_reference": {
@@ -813,12 +660,11 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
             print(f"  📎 Follow-up reply posted (msg_id={message_id})")
         except Exception as e:
             print(f"[followup error] {e}")
-
     threading.Thread(target=_run, daemon=True).start()
 
 # ── ALERT SENDERS ─────────────────────────────────────────────────────────────
 def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
-    summary       = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed_payload = {
         "content": "@everyone 🔥 BEAT REPORTER",
         "embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
@@ -831,17 +677,15 @@ def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
             "color": 0x00FF00,
             "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
     }
-
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
             post_followup_reply(msg_id, handle, True, team, pinch_hitter, replaced)
-
     threading.Thread(target=_send, daemon=True).start()
     print(f"  🟢 Reporter: {team} — {summary}")
 
 def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
-    summary       = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     embed_payload = {
         "content": "@everyone",
         "embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
@@ -854,24 +698,18 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
             "color": 0xF1C40F,
             "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
     }
-
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
             post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced)
-
     threading.Thread(target=_send, daemon=True).start()
     print(f"  🟡 General: {team} — {summary}")
 
-# ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
-def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
-    """
-    Final stage: roster check (for non-reporters), cooldown, team lookup, fire.
-    v15 FIX: BOTH names must resolve to an MLB roster entry (changed `and` to `or`).
-    """
+# ── CORE: FIRE ALERT ──────────────────────────────────────────────────────────
+def _fire_alert(handle, text, tid, pinch_hitter, replaced):
     is_reporter = handle in REPORTER_HANDLES
 
-    # For non-reporters: BOTH names must resolve to MLB rosters
+    # For non-reporters: both names must resolve to MLB rosters
     if not is_reporter:
         ph_team  = lookup_player_team(pinch_hitter)
         out_team = lookup_player_team(replaced)
@@ -879,8 +717,7 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
             missing = []
             if not ph_team:  missing.append(pinch_hitter)
             if not out_team: missing.append(replaced)
-            print(f"  🚫 @{handle}: roster miss for {missing}"
-                  f"{' [via Claude]' if via_claude else ''}")
+            print(f"  🚫 @{handle}: roster miss for {missing}")
             post_drop_log(handle, f"roster miss: {', '.join(missing)}", text)
             return
 
@@ -904,8 +741,7 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
     posted_alert_keys.add(tid)
 
     print(f"  ✅ VALID: @{handle} ({'reporter' if is_reporter else 'general'}) "
-          f"team={team} | {pinch_hitter} for {replaced}"
-          f"{' [via Claude]' if via_claude else ''}")
+          f"team={team} | {pinch_hitter} for {replaced}")
     print(f"     {text[:120]}")
 
     record_player_alert(pinch_hitter)
@@ -915,7 +751,7 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False):
     else:
         post_general_alert(handle, text, url, team, pinch_hitter, replaced)
 
-
+# ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
 def handle_tweet(tid, text, handle):
     maybe_reset_daily()
 
@@ -925,6 +761,7 @@ def handle_tweet(tid, text, handle):
         return
     seen_tweet_ids.add(tid)
 
+    # ── Stage 1: Cheap string pre-filters ────────────────────────────────────
     if not has_core_phrase(text):
         return
 
@@ -944,45 +781,31 @@ def handle_tweet(tid, text, handle):
         post_drop_log(handle, f"reject phrase: {phrase}", text)
         return
 
-    # ── Stage 1: Try regex extraction ────────────────────────────────────────
-    pinch_hitter, replaced = extract_players(text)
-
-    if pinch_hitter and replaced:
-        print(f"  📝 Regex extracted: ph='{pinch_hitter}' out='{replaced}' from @{handle}")
-        _fire_alert(handle, text, tid, pinch_hitter, replaced, via_claude=False)
-        return
-
-    # ── Stage 2: Regex failed — try Claude ───────────────────────────────────
-    is_reporter = handle in REPORTER_HANDLES
-    if not is_reporter and not tweet_has_mlb_context(text, handle):
-        print(f"  🚫 @{handle}: regex failed + no MLB context — {text[:60]}")
-        post_drop_log(handle, "regex failed, no MLB context", text)
-        return
-
+    # ── Stage 2: Claude classifies + extracts names ───────────────────────────
     if not ANTHROPIC_API_KEY:
-        print(f"  🚫 @{handle}: regex failed, no Claude API key — {text[:60]}")
-        post_drop_log(handle, "regex failed, no Claude key", text)
+        print(f"  🚫 @{handle}: no Claude API key — {text[:60]}")
+        post_drop_log(handle, "no Claude API key", text)
         return
 
-    print(f"  🤖 Regex failed for @{handle} — sending to Claude: {text[:80]}")
+    print(f"  🤖 Sending to Claude: @{handle} — {text[:80]}")
 
-    _tid     = tid
-    _text    = text
-    _handle  = handle
+    _tid    = tid
+    _text   = text
+    _handle = handle
 
     def on_claude_result(is_valid, ph, out, reason):
         if not is_valid:
-            print(f"  🚫 @{_handle}: Claude rejected — {reason} — {_text[:60]}")
+            print(f"  🚫 @{_handle}: Claude rejected — {reason}")
             post_drop_log(_handle, f"Claude: {reason}", _text)
             return
         if not ph or not out:
-            print(f"  🚫 @{_handle}: Claude valid but couldn't extract names — {_text[:60]}")
+            print(f"  🚫 @{_handle}: Claude valid but couldn't extract names")
             post_drop_log(_handle, "Claude: valid but names unclear", _text)
             return
         print(f"  🤖 Claude extracted: ph='{ph}' out='{out}' — {reason}")
-        _fire_alert(_handle, _text, _tid, ph, out, via_claude=True)
+        _fire_alert(_handle, _text, _tid, ph, out)
 
-    claude_extract_and_classify(text, on_claude_result)
+    claude_classify(text, on_claude_result)
 
 # ── TWITTER STREAM ────────────────────────────────────────────────────────────
 def get_stream_rules():
@@ -1083,59 +906,15 @@ def run_stream():
         time.sleep(reconnect_wait)
         reconnect_wait = min(reconnect_wait * 2, 300)
 
-# ── REPORTER POLLER ───────────────────────────────────────────────────────────
-def get_user_ids_batch(handles):
-    try:
-        r = requests.get(
-            "https://api.twitter.com/2/users/by",
-            headers=TWITTER_HEADERS,
-            params={"usernames": ",".join(handles)},
-            timeout=10
-        )
-        r.raise_for_status()
-        return {u["username"].lower(): u["id"] for u in r.json().get("data", [])}
-    except Exception as e:
-        print(f"[user id error] {e}")
-        return {}
-
-def get_user_tweets(user_id, max_results=5):
-    try:
-        r = requests.get(
-            f"https://api.twitter.com/2/users/{user_id}/tweets",
-            headers=TWITTER_HEADERS,
-            params={"max_results": max_results, "tweet.fields": "created_at,text"},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json().get("data", [])
-    except Exception as e:
-        print(f"[user tweets error] {e}")
-        return []
-
-def poll_reporters_forever(user_ids):
-    def loop():
-        while True:
-            if is_game_hours():
-                for reporter in REPORTERS:
-                    handle = reporter["handle"].lower()
-                    uid    = user_ids.get(handle)
-                    if not uid:
-                        continue
-                    for t in get_user_tweets(uid, max_results=5):
-                        handle_tweet(t.get("id", ""), t.get("text", ""), handle)
-            time.sleep(10)
-    threading.Thread(target=loop, daemon=True).start()
-    print("[reporters] Background poller started (every 10s)\n")
-
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v15.0")
-    print("   ✅ Fix 1: Regex requires Title-Case proper nouns — no more 'to'/'him'/'was' as names")
-    print("   ✅ Fix 2: Claude now extracts names when regex fails (not just yes/no confirm)")
-    print("   ✅ Fix 3: MLB context gate moved AFTER regex — player names ARE the context proof")
-    print("   ✅ Fix 4: Reporter tweets go through Claude name check too (no more 'was'/'him' alerts)")
-    print("   ✅ Fix 5: BOTH names must resolve to MLB roster — no more high school tweets firing")
-    print(f"   {len(REPORTERS)} reporters | game hours 12pm-1am ET\n")
+    print("⚾ MLB Pinch Hit Bot v16.0")
+    print("   ✅ Removed: Reporter poller (stream catches them, poller burned credits)")
+    print("   ✅ Removed: Regex name extraction (Claude handles all extraction)")
+    print("   ✅ Kept:    Cheap string pre-filters (reject phrases, question, result-after-ph)")
+    print("   ✅ Kept:    Roster gate for non-reporters")
+    print("   ✅ Kept:    Reporter trust system (green vs yellow alerts)")
+    print(f"   {len(REPORTERS)} reporters tracked | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
         print("[error] TWITTER_BEARER_TOKEN not set!")
@@ -1144,25 +923,18 @@ def run():
         print("[error] PINCH_HIT_WEBHOOK_URL not set!")
         return
     if not DISCORD_CHANNEL_ID:
-        print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies will be skipped")
+        print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies skipped")
     if not ANTHROPIC_API_KEY:
-        print("[warning] ANTHROPIC_API_KEY not set — Claude fallback will be skipped")
+        print("[error] ANTHROPIC_API_KEY not set — bot cannot classify tweets!")
+        return
     if not DISCORD_LOG_WEBHOOK:
-        print("[warning] DISCORD_LOG_WEBHOOK_URL not set — drop logging will be skipped")
+        print("[warning] DISCORD_LOG_WEBHOOK_URL not set — drop logging skipped")
 
     start_lineup_refresh_thread()
     prefetch_full_rosters()
     time.sleep(5)
 
-    print("Looking up reporter user IDs...")
-    handles  = [r["handle"] for r in REPORTERS]
-    user_ids = {}
-    for i in range(0, len(handles), 100):
-        user_ids.update(get_user_ids_batch(handles[i:i+100]))
-    print(f"Found {len(user_ids)} user IDs\n")
-
     setup_stream_rules()
-    poll_reporters_forever(user_ids)
     run_stream()
 
 if __name__ == "__main__":
