@@ -1,14 +1,19 @@
 """
-MLB Pinch Hit Alert Bot — v16.0
+MLB Pinch Hit Alert Bot — v17.0
 
-Changes from v15.0:
-- REMOVED: Reporter poller (stream catches them anyway, poller was burning credits)
-- REMOVED: Regex name extraction (Claude handles all extraction, more accurate)
-- REMOVED: MLB context pre-check (Claude does this better)
-- KEPT:    Cheap string pre-filters (reject phrases, question check, result-after-ph)
-- KEPT:    Roster gate for non-reporters (still validates extracted names)
-- KEPT:    Reporter trust system (beat reporters get green alert, others yellow)
-- RESULT:  Simpler pipeline, lower API cost, fewer missed alerts
+Changes from v16.0:
+- LATENCY: Reporters now fire IMMEDIATELY on cheap-filter pass (trusted source);
+           Claude runs ASYNC only to fill in structured names / retract if it
+           turns out invalid. Removes the ~1-2s Anthropic round-trip from the
+           critical path for the alerts that matter most.
+- LATENCY: Claude timeout 15s -> 5s (a slow Anthropic call could silently delay
+           an alert past any bettable window).
+- MEASURE: Every alert now logs pipeline latency (now - tweet.created_at) in the
+           footer, e.g. "fired 2.3s after tweet". Tells you how much of a miss is
+           your pipeline vs. the reporter being slow.
+- Non-reporter path unchanged (still gates on Claude + roster).
+- ANTHROPIC_API_KEY now optional: reporters fire without it; only non-reporters
+  are disabled if it's missing.
 """
 
 import os
@@ -41,6 +46,21 @@ _SUFFIXES = re.compile(r'\b(jr\.?|sr\.?|ii|iii|iv)\s*$', re.IGNORECASE)
 
 def strip_suffix(name):
     return _SUFFIXES.sub('', normalize(name)).strip()
+
+# ── TWEET LATENCY ─────────────────────────────────────────────────────────────
+def _tweet_latency(created_at):
+    """Seconds from tweet creation to now (your pipeline latency). None if unknown.
+    Twitter created_at is ISO 8601, e.g. '2024-06-01T23:15:30.000Z'."""
+    if not created_at:
+        return None
+    try:
+        t = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
+
+def _latency_str(latency):
+    return f"{latency:.1f}s" if latency is not None else "n/a"
 
 # ── BEAT REPORTERS ────────────────────────────────────────────────────────────
 REPORTERS = [
@@ -465,7 +485,7 @@ def start_lineup_refresh_thread():
     threading.Thread(target=loop, daemon=True).start()
     print("[lineup] Background refresh thread started (every 5 min)\n")
 
-# ── CLAUDE — PRIMARY CLASSIFIER + NAME EXTRACTOR ──────────────────────────────
+# ── CLAUDE — NAME EXTRACTOR + VALIDATOR ───────────────────────────────────────
 CLAUDE_SYSTEM = """You are an MLB pinch hit alert parser. Extract player names and classify tweets.
 
 Given a tweet, respond with ONLY a JSON object (no markdown, no explanation):
@@ -515,7 +535,7 @@ def claude_classify(tweet_text, callback):
                     "system":     CLAUDE_SYSTEM,
                     "messages":   [{"role": "user", "content": f'Tweet: "{tweet_text}"'}],
                 },
-                timeout=15
+                timeout=5  # v17: was 15s — a slow call must not delay an alert
             )
             r.raise_for_status()
             raw = r.json()["content"][0]["text"].strip()
@@ -552,6 +572,23 @@ def _post_discord_now(payload, return_msg_id=False):
 def post_discord(payload):
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
 
+def _post_reply(message_id, content):
+    """Post a threaded reply to an existing alert message (name enrichment / retract)."""
+    if not (message_id and DISCORD_CHANNEL_ID and DISCORD_WEBHOOK_URL):
+        return
+    payload = {
+        "content": content,
+        "message_reference": {
+            "message_id":         message_id,
+            "channel_id":         DISCORD_CHANNEL_ID,
+            "fail_if_not_exists": False,
+        },
+    }
+    try:
+        requests.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10)
+    except Exception as e:
+        print(f"[reply error] {e}")
+
 # ── DROP LOG ──────────────────────────────────────────────────────────────────
 def post_drop_log(handle, reason, text):
     if not DISCORD_LOG_WEBHOOK:
@@ -570,7 +607,7 @@ def post_drop_log(handle, reason, text):
             print(f"[log error] {e}")
     threading.Thread(target=_send, daemon=True).start()
 
-# ── ENRICHMENT ────────────────────────────────────────────────────────────────
+# ── ENRICHMENT (general alerts only) ──────────────────────────────────────────
 def fetch_twitter_user_info(handle):
     try:
         r = requests.get(
@@ -640,52 +677,54 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
             )
         else:
             lines.append("👤 **Account:** Could not fetch info")
-        if is_reporter:
-            lines.append(f"🎙️ **Source type:** Official {team} beat reporter")
-        else:
-            lines.append("🌐 **Source type:** General Twitter user")
+        lines.append("🌐 **Source type:** General Twitter user")
         lines.append(f"\n**Validity: {score}/10 — {label}**")
         for reason in reasons:
             lines.append(f"  {reason}")
-        payload = {
-            "content": "\n".join(lines),
-            "message_reference": {
-                "message_id":         message_id,
-                "channel_id":         DISCORD_CHANNEL_ID,
-                "fail_if_not_exists": False,
-            }
-        }
-        try:
-            requests.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10).raise_for_status()
-            print(f"  📎 Follow-up reply posted (msg_id={message_id})")
-        except Exception as e:
-            print(f"[followup error] {e}")
+        _post_reply(message_id, "\n".join(lines))
     threading.Thread(target=_run, daemon=True).start()
 
 # ── ALERT SENDERS ─────────────────────────────────────────────────────────────
-def post_reporter_alert(handle, text, url, team, pinch_hitter, replaced):
-    summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+def post_reporter_alert_fast(handle, text, url, team, latency):
+    """v17: Fire the reporter alert IMMEDIATELY (trusted source, cheap filters
+    already passed). Claude runs ASYNC only to fill in the structured names or
+    retract if it turns out invalid — it is NOT on the critical path."""
+    footer = f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+    if latency is not None:
+        footer += f" · fired {latency:.1f}s after tweet"
     embed_payload = {
         "content": "@everyone 🔥 BEAT REPORTER",
         "embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
             "description": (
                 f"**Verified beat reporter — pre-event pinch hit**\n\n"
-                f"📋 **{summary}**\n\n"
                 f"🎙️ **@{handle}:**\n_{text[:200]}_\n🔗 [View Tweet]({url})\n\n"
                 f"💰 **HIGH CONFIDENCE — BET THE UNDER NOW**"
             ),
             "color": 0x00FF00,
-            "footer": {"text": f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
+            "footer": {"text": footer}}]
     }
+
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
-        if msg_id:
-            post_followup_reply(msg_id, handle, True, team, pinch_hitter, replaced)
-    threading.Thread(target=_send, daemon=True).start()
-    print(f"  🟢 Reporter: {team} — {summary}")
 
-def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
+        def on_claude(is_valid, ph, out, reason):
+            if is_valid and ph and out:
+                record_player_alert(ph)
+                _post_reply(msg_id, f"📋 **{ph}** will pinch hit for **{out}**")
+            elif reason and not reason.startswith("No API key") \
+                    and not reason.startswith("Claude error"):
+                _post_reply(msg_id, f"⚠️ Auto-check flagged this as possibly invalid: _{reason}_")
+
+        claude_classify(text, on_claude)
+
+    threading.Thread(target=_send, daemon=True).start()
+    print(f"  ⚡🟢 Reporter (fast fire): {team} — @{handle} | latency {_latency_str(latency)}")
+
+def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=None):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    footer = f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+    if latency is not None:
+        footer += f" · fired {latency:.1f}s after tweet"
     embed_payload = {
         "content": "@everyone",
         "embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
@@ -696,63 +735,48 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced):
                 f"💰 **BET THE UNDER NOW**"
             ),
             "color": 0xF1C40F,
-            "footer": {"text": f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"}}]
+            "footer": {"text": footer}}]
     }
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
             post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced)
     threading.Thread(target=_send, daemon=True).start()
-    print(f"  🟡 General: {team} — {summary}")
+    print(f"  🟡 General: {team} — {summary} | latency {_latency_str(latency)}")
 
-# ── CORE: FIRE ALERT ──────────────────────────────────────────────────────────
-def _fire_alert(handle, text, tid, pinch_hitter, replaced):
-    is_reporter = handle in REPORTER_HANDLES
-
-    # For non-reporters: both names must resolve to MLB rosters
-    if not is_reporter:
-        ph_team  = lookup_player_team(pinch_hitter)
-        out_team = lookup_player_team(replaced)
-        if not ph_team or not out_team:
-            missing = []
-            if not ph_team:  missing.append(pinch_hitter)
-            if not out_team: missing.append(replaced)
-            print(f"  🚫 @{handle}: roster miss for {missing}")
-            post_drop_log(handle, f"roster miss: {', '.join(missing)}", text)
-            return
+# ── CORE: FIRE ALERT (non-reporters only) ─────────────────────────────────────
+def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
+    ph_team  = lookup_player_team(pinch_hitter)
+    out_team = lookup_player_team(replaced)
+    if not ph_team or not out_team:
+        missing = []
+        if not ph_team:  missing.append(pinch_hitter)
+        if not out_team: missing.append(replaced)
+        print(f"  🚫 @{handle}: roster miss for {missing}")
+        post_drop_log(handle, f"roster miss: {', '.join(missing)}", text)
+        return
 
     if is_player_on_cooldown(pinch_hitter):
         print(f"  🔇 '{pinch_hitter}' on cooldown")
         post_drop_log(handle, f"cooldown: {pinch_hitter}", text)
         return
 
-    reporter = REPORTER_BY_HANDLE.get(handle)
-    team     = reporter["team"] if reporter else None
-    if not team:
-        team = lookup_player_team(pinch_hitter) or lookup_player_team(replaced)
-    if not team:
-        team = infer_team_from_text(text)
-    if not team:
-        team = "Unknown Team"
+    team = lookup_player_team(pinch_hitter) or lookup_player_team(replaced) \
+           or infer_team_from_text(text) or "Unknown Team"
 
     url = f"https://twitter.com/{handle}/status/{tid}"
     if tid in posted_alert_keys:
         return
     posted_alert_keys.add(tid)
 
-    print(f"  ✅ VALID: @{handle} ({'reporter' if is_reporter else 'general'}) "
-          f"team={team} | {pinch_hitter} for {replaced}")
+    print(f"  ✅ VALID: @{handle} (general) team={team} | {pinch_hitter} for {replaced}")
     print(f"     {text[:120]}")
 
     record_player_alert(pinch_hitter)
-
-    if is_reporter:
-        post_reporter_alert(handle, text, url, team, pinch_hitter, replaced)
-    else:
-        post_general_alert(handle, text, url, team, pinch_hitter, replaced)
+    post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency)
 
 # ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
-def handle_tweet(tid, text, handle):
+def handle_tweet(tid, text, handle, created_at=None):
     maybe_reset_daily()
 
     if not is_game_hours():
@@ -781,17 +805,29 @@ def handle_tweet(tid, text, handle):
         post_drop_log(handle, f"reject phrase: {phrase}", text)
         return
 
-    # ── Stage 2: Claude classifies + extracts names ───────────────────────────
+    latency = _tweet_latency(created_at)
+
+    # ── REPORTER FAST PATH (v17): fire NOW, Claude enriches async ─────────────
+    if handle in REPORTER_HANDLES:
+        if tid in posted_alert_keys:
+            return
+        posted_alert_keys.add(tid)
+        reporter = REPORTER_BY_HANDLE.get(handle)
+        team = reporter["team"] if reporter else (infer_team_from_text(text) or "Unknown Team")
+        url  = f"https://twitter.com/{handle}/status/{tid}"
+        print(f"  ⚡ FAST REPORTER FIRE: @{handle} team={team} | {text[:100]}")
+        post_reporter_alert_fast(handle, text, url, team, latency)
+        return
+
+    # ── NON-REPORTER: gate on Claude as before ───────────────────────────────
     if not ANTHROPIC_API_KEY:
-        print(f"  🚫 @{handle}: no Claude API key — {text[:60]}")
+        print(f"  🚫 @{handle}: no Claude API key (non-reporter) — {text[:60]}")
         post_drop_log(handle, "no Claude API key", text)
         return
 
     print(f"  🤖 Sending to Claude: @{handle} — {text[:80]}")
 
-    _tid    = tid
-    _text   = text
-    _handle = handle
+    _tid, _text, _handle, _latency = tid, text, handle, latency
 
     def on_claude_result(is_valid, ph, out, reason):
         if not is_valid:
@@ -803,7 +839,7 @@ def handle_tweet(tid, text, handle):
             post_drop_log(_handle, "Claude: valid but names unclear", _text)
             return
         print(f"  🤖 Claude extracted: ph='{ph}' out='{out}' — {reason}")
-        _fire_alert(_handle, _text, _tid, ph, out)
+        _fire_alert(_handle, _text, _tid, ph, out, _latency)
 
     claude_classify(text, on_claude_result)
 
@@ -895,7 +931,8 @@ def run_stream():
                 handle_tweet(
                     tweet_data.get("id", ""),
                     tweet_data.get("text", ""),
-                    users.get(tweet_data.get("author_id", ""), "unknown")
+                    users.get(tweet_data.get("author_id", ""), "unknown"),
+                    tweet_data.get("created_at"),
                 )
         except requests.exceptions.ChunkedEncodingError:
             print(f"[stream] Dropped — reconnecting in {reconnect_wait}s...")
@@ -908,12 +945,10 @@ def run_stream():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v16.0")
-    print("   ✅ Removed: Reporter poller (stream catches them, poller burned credits)")
-    print("   ✅ Removed: Regex name extraction (Claude handles all extraction)")
-    print("   ✅ Kept:    Cheap string pre-filters (reject phrases, question, result-after-ph)")
-    print("   ✅ Kept:    Roster gate for non-reporters")
-    print("   ✅ Kept:    Reporter trust system (green vs yellow alerts)")
+    print("⚾ MLB Pinch Hit Bot v17.0")
+    print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
+    print("   ⏱️ Claude timeout 15s -> 5s")
+    print("   📏 Every alert logs pipeline latency (now - tweet.created_at)")
     print(f"   {len(REPORTERS)} reporters tracked | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
@@ -925,8 +960,8 @@ def run():
     if not DISCORD_CHANNEL_ID:
         print("[warning] DISCORD_CHANNEL_ID not set — follow-up replies skipped")
     if not ANTHROPIC_API_KEY:
-        print("[error] ANTHROPIC_API_KEY not set — bot cannot classify tweets!")
-        return
+        print("[warning] ANTHROPIC_API_KEY not set — reporters still fire; "
+              "non-reporter alerts disabled")
     if not DISCORD_LOG_WEBHOOK:
         print("[warning] DISCORD_LOG_WEBHOOK_URL not set — drop logging skipped")
 
