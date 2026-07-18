@@ -1,7 +1,24 @@
 """
-MLB Pinch Hit Alert Bot — v17.0
+MLB Pinch Hit Alert Bot — v17.2
 
-Changes from v16.0:
+Changes from v17.1: none functionally — same corroboration-reply dedupe
+logic and same expanded stream rules. (Outcome/latency logging that was
+briefly added here has been removed per request — not needed.)
+
+Changes from v17.0:
+- DEDUPE: When two different (non-reporter) tweets report the SAME event
+          (same pinch hitter + same player replaced) within a short window,
+          the second+ tweet is now posted as a THREADED REPLY on the original
+          alert ("✅ Corroborated by @handle") instead of firing a brand new
+          @everyone embed. Prevents duplicate "BET THE UNDER NOW" pings for
+          one real-world sub.
+- Event key is last-name-based (pinch_hitter_last|replaced_last) so minor
+  name-formatting differences between tweets ("Luis Lara" vs "L. Lara")
+  still match.
+- CORROBORATION_WINDOW_SEC = 600 (10 min) — tune as needed.
+- recent_fired_events is cleared on the daily reset, same as other state.
+
+Changes from v16.0 (carried forward):
 - LATENCY: Reporters now fire IMMEDIATELY on cheap-filter pass (trusted source);
            Claude runs ASYNC only to fill in structured names / retract if it
            turns out invalid. Removes the ~1-2s Anthropic round-trip from the
@@ -36,6 +53,7 @@ ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
 LINEUP_REFRESH_SECS  = 300
+CORROBORATION_WINDOW_SEC = 600  # v17.1: window to treat a 2nd report as corroboration, not a new alert
 
 # ── ASCII NORMALIZATION ───────────────────────────────────────────────────────
 def normalize(text):
@@ -170,6 +188,13 @@ STREAM_RULES = [
     {"value": '"hitting in place of" -is:retweet lang:en',    "tag": "in_place_of"},
     {"value": '"sent up for" -is:retweet lang:en',            "tag": "sent_up_short"},
     {"value": '"called upon to hit for" -is:retweet lang:en', "tag": "called_upon"},
+    # v17.1: added — these already existed in PINCH_HIT_PHRASES_LOWER (the
+    # post-arrival string check) but were never actually requested from
+    # Twitter, so matching tweets were silently never delivered at all.
+    {"value": '"pinch hitting for" -is:retweet lang:en',      "tag": "pinch_hitting_for"},
+    {"value": '"pinch-hitting for" -is:retweet lang:en',      "tag": "pinch_hitting_for_hyph"},
+    {"value": '"will be ph for" -is:retweet lang:en',         "tag": "will_be_ph_for"},
+    {"value": '"coming up to hit for" -is:retweet lang:en',   "tag": "coming_up_to_hit_for"},
 ]
 
 # ── CHEAP STRING PRE-FILTERS (run before Claude to save API calls) ────────────
@@ -242,16 +267,22 @@ def result_comes_after_ph(text):
     return any(word in after_text for word in RESULT_WORDS)
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
-seen_tweet_ids     = set()
-posted_alert_keys  = set()
-last_reset_date    = None
-player_alert_count = {}
-player_alert_time  = {}
-daily_lineup_map   = {}
-last_lineup_refresh = 0
-_name_index        = {}
-_name_lock         = threading.Lock()
-_lineup_lock       = threading.Lock()
+seen_tweet_ids       = set()
+posted_alert_keys    = set()
+last_reset_date      = None
+player_alert_count   = {}
+player_alert_time    = {}
+daily_lineup_map     = {}
+last_lineup_refresh  = 0
+_name_index          = {}
+_name_lock           = threading.Lock()
+_lineup_lock         = threading.Lock()
+
+# v17.1: tracks the most recent alert fired for a given (pinch_hitter, replaced)
+# event so a second corroborating tweet can be posted as a reply instead of a
+# brand new @everyone alert.
+recent_fired_events  = {}
+_events_lock         = threading.Lock()
 
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
@@ -266,6 +297,7 @@ def is_game_hours():
 def maybe_reset_daily():
     global seen_tweet_ids, last_reset_date, posted_alert_keys
     global player_alert_count, player_alert_time, daily_lineup_map, last_lineup_refresh
+    global recent_fired_events
     today = datetime.now(ET_TZ).date()
     if last_reset_date is None:
         last_reset_date = today
@@ -279,6 +311,8 @@ def maybe_reset_daily():
         daily_lineup_map    = {}
         last_lineup_refresh = 0
         _name_index.clear()
+        with _events_lock:
+            recent_fired_events.clear()
         last_reset_date     = today
 
 # ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
@@ -298,6 +332,25 @@ def record_player_alert(name):
     key = strip_suffix(name).split()[-1]
     player_alert_count[key] = player_alert_count.get(key, 0) + 1
     player_alert_time[key]  = time.time()
+
+# ── EVENT DEDUPE / CORROBORATION (v17.1) ──────────────────────────────────────
+def _event_key(pinch_hitter, replaced):
+    """Last-name-based key so 'Luis Lara' and 'L. Lara' still match."""
+    ph_last  = strip_suffix(pinch_hitter).split()[-1] if pinch_hitter else ""
+    out_last = strip_suffix(replaced).split()[-1]     if replaced     else ""
+    return f"{ph_last}|{out_last}"
+
+def _get_recent_event(key):
+    now = time.time()
+    with _events_lock:
+        entry = recent_fired_events.get(key)
+        if entry and (now - entry["time"]) <= CORROBORATION_WINDOW_SEC:
+            return entry
+    return None
+
+def _record_event(key, message_id):
+    with _events_lock:
+        recent_fired_events[key] = {"message_id": message_id, "time": time.time()}
 
 # ── ROSTER / NAME INDEX ───────────────────────────────────────────────────────
 def _add_player_to_map(target_map, full_name, team_name):
@@ -573,7 +626,7 @@ def post_discord(payload):
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
 
 def _post_reply(message_id, content):
-    """Post a threaded reply to an existing alert message (name enrichment / retract)."""
+    """Post a threaded reply to an existing alert message (name enrichment / retract / corroboration)."""
     if not (message_id and DISCORD_CHANNEL_ID and DISCORD_WEBHOOK_URL):
         return
     payload = {
@@ -710,6 +763,8 @@ def post_reporter_alert_fast(handle, text, url, team, latency):
         def on_claude(is_valid, ph, out, reason):
             if is_valid and ph and out:
                 record_player_alert(ph)
+                if msg_id:
+                    _record_event(_event_key(ph, out), msg_id)
                 _post_reply(msg_id, f"📋 **{ph}** will pinch hit for **{out}**")
             elif reason and not reason.startswith("No API key") \
                     and not reason.startswith("Claude error"):
@@ -720,7 +775,7 @@ def post_reporter_alert_fast(handle, text, url, team, latency):
     threading.Thread(target=_send, daemon=True).start()
     print(f"  ⚡🟢 Reporter (fast fire): {team} — @{handle} | latency {_latency_str(latency)}")
 
-def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=None):
+def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=None, event_key=None):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
     footer = f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     if latency is not None:
@@ -740,9 +795,22 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
         if msg_id:
+            if event_key:
+                _record_event(event_key, msg_id)
             post_followup_reply(msg_id, handle, False, team, pinch_hitter, replaced)
     threading.Thread(target=_send, daemon=True).start()
     print(f"  🟡 General: {team} — {summary} | latency {_latency_str(latency)}")
+
+def post_corroboration_reply(message_id, handle, text, url, pinch_hitter, replaced):
+    """v17.1: A second (or later) tweet reporting the SAME event as an alert
+    already fired within CORROBORATION_WINDOW_SEC. Reply on the original
+    thread instead of firing a new @everyone alert."""
+    content = (
+        f"✅ **Corroborated** by @{handle} — {pinch_hitter} for {replaced}\n"
+        f"_{text[:200]}_\n🔗 [View Tweet]({url})"
+    )
+    threading.Thread(target=_post_reply, args=(message_id, content), daemon=True).start()
+    print(f"  🔁 Corroboration only: @{handle} confirms {pinch_hitter} for {replaced}")
 
 # ── CORE: FIRE ALERT (non-reporters only) ─────────────────────────────────────
 def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
@@ -756,6 +824,19 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
         post_drop_log(handle, f"roster miss: {', '.join(missing)}", text)
         return
 
+    url = f"https://twitter.com/{handle}/status/{tid}"
+
+    # v17.1: if this exact event was already alerted recently, corroborate
+    # via reply instead of firing a duplicate full alert.
+    event_key = _event_key(pinch_hitter, replaced)
+    recent    = _get_recent_event(event_key)
+    if recent:
+        if tid in posted_alert_keys:
+            return
+        posted_alert_keys.add(tid)
+        post_corroboration_reply(recent["message_id"], handle, text, url, pinch_hitter, replaced)
+        return
+
     if is_player_on_cooldown(pinch_hitter):
         print(f"  🔇 '{pinch_hitter}' on cooldown")
         post_drop_log(handle, f"cooldown: {pinch_hitter}", text)
@@ -764,7 +845,6 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
     team = lookup_player_team(pinch_hitter) or lookup_player_team(replaced) \
            or infer_team_from_text(text) or "Unknown Team"
 
-    url = f"https://twitter.com/{handle}/status/{tid}"
     if tid in posted_alert_keys:
         return
     posted_alert_keys.add(tid)
@@ -773,7 +853,7 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
     print(f"     {text[:120]}")
 
     record_player_alert(pinch_hitter)
-    post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency)
+    post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency, event_key)
 
 # ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
 def handle_tweet(tid, text, handle, created_at=None):
@@ -945,9 +1025,10 @@ def run_stream():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.0")
+    print("⚾ MLB Pinch Hit Bot v17.2")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
+    print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
     print("   📏 Every alert logs pipeline latency (now - tweet.created_at)")
     print(f"   {len(REPORTERS)} reporters tracked | game hours 12pm-1am ET\n")
 
