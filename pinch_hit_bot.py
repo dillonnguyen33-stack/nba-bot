@@ -1,9 +1,28 @@
 """
-MLB Pinch Hit Alert Bot — v17.2
+MLB Pinch Hit Alert Bot — v17.3
 
-Changes from v17.1: none functionally — same corroboration-reply dedupe
-logic and same expanded stream rules. (Outcome/latency logging that was
-briefly added here has been removed per request — not needed.)
+Changes from v17.2:
+- RECALL AUDIT: New end-of-day job (runs ~AUDIT_HOUR_ET, default 3am ET) that
+  pulls the official MLB pinch-hit substitutions from StatsAPI play-by-play,
+  checks each against a lightweight in-memory fire-log of what the bot alerted
+  on that day, and for every MISS does a medium-breadth Twitter *recent search*
+  (player name + pinch/hit/PH terms, bounded window + low max_results to protect
+  quota) and asks Claude whether any surfaced tweet was a catchable pre-event
+  alert and why the live stream would have missed it. Results post to a
+  dedicated audit webhook (DISCORD_AUDIT_WEBHOOK_URL), falling back to the log
+  webhook. Only misses trigger a search, so cost stays low.
+  Manual run: `python3 pinch_hit_bot_v17_2.py --audit YYYY-MM-DD`
+- FIRE-LOG: minimal record_fire/was_fired_today added at both fire points so the
+  audit knows what was caught. Cleared on daily reset.
+- PHRASE TRACKER: for each catchable miss, the audit attributes which *unpromoted*
+  second-tier phrase (in PINCH_HIT_PHRASES_LOWER but not a live STREAM_RULE — i.e.
+  "phing for", "up to hit for", "in to hit for", "batting for", "ph for") would
+  have caught it, and keeps a persistent tally (PHRASE_ROLLUP_PATH) with risk
+  tiers. Posted at the end of each audit so you can promote medium/high-risk
+  phrases to live rules on evidence, not guesswork. Nothing auto-promotes.
+
+Changes from v17.1: expanded stream rules (4 phrasings that were in
+PINCH_HIT_PHRASES_LOWER but never requested from Twitter).
 
 Changes from v17.0:
 - DEDUPE: When two different (non-reporter) tweets report the SAME event
@@ -40,7 +59,7 @@ import json
 import threading
 import unicodedata
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -49,6 +68,12 @@ DISCORD_WEBHOOK_URL  = os.environ.get("PINCH_HIT_WEBHOOK_URL")
 DISCORD_CHANNEL_ID   = os.environ.get("DISCORD_CHANNEL_ID")
 ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY")
 DISCORD_LOG_WEBHOOK  = os.environ.get("DISCORD_LOG_WEBHOOK_URL")
+# v17.3: end-of-day recall audit (separate channel/webhook)
+DISCORD_AUDIT_WEBHOOK = os.environ.get("DISCORD_AUDIT_WEBHOOK_URL")
+AUDIT_HOUR_ET        = int(os.environ.get("AUDIT_HOUR_ET", "3"))   # 3am ET: after all games final
+AUDIT_SEARCH_MAX     = int(os.environ.get("AUDIT_SEARCH_MAX", "10"))  # max tweets pulled per missed PH (quota guard)
+AUDIT_WINDOW_MIN     = int(os.environ.get("AUDIT_WINDOW_MIN", "20"))  # +/- minutes around the sub to search
+PHRASE_ROLLUP_PATH   = os.environ.get("PHRASE_ROLLUP_PATH", "phrase_attribution.json")  # v17.3: persistent tally
 ET_TZ                = ZoneInfo("America/New_York")
 PLAYER_COOLDOWN_SEC  = 7200
 PLAYER_MAX_ALERTS    = 2
@@ -239,6 +264,35 @@ def has_core_phrase(text):
     tl = normalize(text)
     return any(phrase in tl for phrase in PINCH_HIT_PHRASES_LOWER)
 
+# v17.3: phrases that exist in PINCH_HIT_PHRASES_LOWER but are NOT yet promoted
+# to live STREAM_RULES — i.e. the ones the live stream can't catch. The audit
+# attributes each catchable miss to whichever of these would have caught it, so
+# you can see over time which are worth promoting. Risk tier is informational
+# only (shown in the rollup) — nothing auto-promotes.
+UNPROMOTED_PHRASES = {
+    # phrase         : risk tier (informational only — nothing auto-promotes)
+    "phing for":       "low",
+    "up to hit for":   "medium",
+    "in to hit for":   "medium",
+    "batting for":     "high",   # common English idiom ("batting for the team")
+    "ph for":          "high",   # collides with pH / unrelated short strings
+}
+
+# Phrases that ARE live stream rules (derived from PINCH_HIT_PHRASES_LOWER minus
+# the unpromoted set) — used to avoid falsely crediting an unpromoted phrase for
+# a tweet the live stream would already have caught (e.g. "coming up to hit for"
+# contains the substring "up to hit for").
+PROMOTED_PHRASES = [p for p in PINCH_HIT_PHRASES_LOWER if p not in UNPROMOTED_PHRASES]
+
+def attributable_phrases(text):
+    """Which unpromoted second-tier phrases appear in this tweet AND would have
+    been the reason it was caught — i.e. only if no already-promoted phrase
+    already covers the tweet (otherwise the live stream would've caught it)."""
+    tl = normalize(text)
+    if any(p in tl for p in PROMOTED_PHRASES):
+        return []  # a live rule already covers this tweet; not a promotion case
+    return [p for p in UNPROMOTED_PHRASES if p in tl]
+
 def has_reject_phrase(text):
     tl = normalize(text)
     for phrase in REJECT_PHRASES:
@@ -284,10 +338,38 @@ _lineup_lock         = threading.Lock()
 recent_fired_events  = {}
 _events_lock         = threading.Lock()
 
+# v17.3: minimal fire-log — just the info the end-of-day audit needs to know
+# which pinch hits the bot actually alerted on today. Keyed by pinch-hitter
+# last name (matches how MLB play-by-play will be normalized during audit).
+fired_today          = {}   # last_name -> {"handle","full_name","time","path"}
+_fired_log_lock      = threading.Lock()
+last_audit_date      = None
+
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
     "Content-Type":  "application/json",
 }
+
+def record_fire(full_name, handle, path):
+    """path: 'reporter' or 'general'. Records that the bot alerted on this
+    pinch hitter today, for the recall audit to check against."""
+    if not full_name:
+        return
+    key = strip_suffix(full_name).split()[-1]
+    with _fired_log_lock:
+        fired_today[key] = {
+            "handle":    handle,
+            "full_name": full_name,
+            "time":      time.time(),
+            "path":      path,
+        }
+
+def was_fired_today(full_name):
+    if not full_name:
+        return None
+    key = strip_suffix(full_name).split()[-1]
+    with _fired_log_lock:
+        return fired_today.get(key)
 
 # ── GAME HOURS / RESET ────────────────────────────────────────────────────────
 def is_game_hours():
@@ -313,6 +395,8 @@ def maybe_reset_daily():
         _name_index.clear()
         with _events_lock:
             recent_fired_events.clear()
+        with _fired_log_lock:
+            fired_today.clear()
         last_reset_date     = today
 
 # ── PLAYER COOLDOWN ───────────────────────────────────────────────────────────
@@ -763,6 +847,7 @@ def post_reporter_alert_fast(handle, text, url, team, latency):
         def on_claude(is_valid, ph, out, reason):
             if is_valid and ph and out:
                 record_player_alert(ph)
+                record_fire(ph, handle, "reporter")
                 if msg_id:
                     _record_event(_event_key(ph, out), msg_id)
                 _post_reply(msg_id, f"📋 **{ph}** will pinch hit for **{out}**")
@@ -794,6 +879,7 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=
     }
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
+        record_fire(pinch_hitter, handle, "general")
         if msg_id:
             if event_key:
                 _record_event(event_key, msg_id)
@@ -1023,13 +1109,349 @@ def run_stream():
         time.sleep(reconnect_wait)
         reconnect_wait = min(reconnect_wait * 2, 300)
 
+# ── END-OF-DAY RECALL AUDIT (v17.3) ───────────────────────────────────────────
+# Uses MLB's official play-by-play as ground truth for which pinch hits actually
+# happened, checks each against the day's fire-log, and for every MISS does a
+# medium-breadth Twitter *search* (not stream) to surface the tweets your live
+# stream rules never delivered — then asks Claude whether any of them was a
+# pre-event alert you could have caught. Output goes to a dedicated audit
+# webhook/channel. Runs once per day after games are final.
+#
+# Cost profile: Twitter *search* (recent search endpoint) is a separate quota
+# from your filtered stream. This only searches MISSES (typically a handful per
+# slate), bounds each search to AUDIT_SEARCH_MAX tweets and a +/-AUDIT_WINDOW_MIN
+# window, and only sends Claude the misses. Designed to stay well within tier
+# quotas and add negligible Anthropic spend.
+
+# ── PHRASE ATTRIBUTION ROLLUP (v17.3) ─────────────────────────────────────────
+# Persistent tally (survives restarts) of how often each UNPROMOTED phrase would
+# have caught a real, Claude-confirmed catchable miss. This is the evidence you
+# use to decide whether to promote a medium/high-risk phrase to a live stream
+# rule — nothing here auto-promotes.
+_rollup_lock = threading.Lock()
+
+def _load_rollup():
+    try:
+        with open(PHRASE_ROLLUP_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_rollup(data):
+    try:
+        with open(PHRASE_ROLLUP_PATH, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        print(f"[rollup save error] {e}")
+
+def record_phrase_attribution(phrases, date_str):
+    """phrases: list of unpromoted phrases that appeared in a confirmed catchable
+    miss. Increments each phrase's all-time and last-7-day counters."""
+    if not phrases:
+        return
+    with _rollup_lock:
+        data = _load_rollup()
+        for p in phrases:
+            entry = data.get(p, {"total": 0, "risk": UNPROMOTED_PHRASES.get(p, "?"), "recent": []})
+            entry["total"] += 1
+            entry["recent"].append(date_str)
+            # keep only last 14 dates of history per phrase
+            entry["recent"] = entry["recent"][-14:]
+            data[p] = entry
+        _save_rollup(data)
+
+def format_rollup_summary():
+    data = _load_rollup()
+    if not data:
+        return "📈 **Phrase-promotion tracker:** no attributable catchable misses recorded yet."
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    lines = ["📈 **Phrase-promotion tracker** — unpromoted phrases that would have caught a real miss:"]
+    # sort by last-7-day count desc, then total
+    def recent_count(e):
+        return sum(1 for d in e.get("recent", []) if d >= cutoff)
+    for phrase, e in sorted(data.items(), key=lambda kv: (recent_count(kv[1]), kv[1]["total"]), reverse=True):
+        r7 = recent_count(e)
+        lines.append(
+            f"  • `{phrase}` [{e.get('risk','?')} risk] — "
+            f"{r7} in last 7d, {e['total']} all-time"
+        )
+    lines.append("\n_Promote a phrase to a live stream rule when its count justifies the noise/quota tradeoff. Say the word and it gets added._")
+    return "\n".join(lines)
+
+def _audit_post(content):
+    hook = DISCORD_AUDIT_WEBHOOK or DISCORD_LOG_WEBHOOK
+    if not hook:
+        print("[audit] No audit/log webhook set — printing instead:\n" + content)
+        return
+    try:
+        # Discord 2000-char limit; chunk if needed.
+        for i in range(0, len(content), 1900):
+            requests.post(hook, json={"content": content[i:i+1900]}, timeout=10)
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"[audit post error] {e}")
+
+def fetch_official_pinch_hits(date_str):
+    """Return list of dicts: {player, team, game_pk, when_utc (datetime|None)}
+    for every official pinch-hit substitution in MLB play-by-play on date_str."""
+    results = []
+    try:
+        sched = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId": 1, "date": date_str, "gameType": "R"},
+            timeout=10,
+        )
+        sched.raise_for_status()
+        game_pks = [g["gamePk"]
+                    for d in sched.json().get("dates", [])
+                    for g in d.get("games", [])
+                    if g.get("status", {}).get("abstractGameState") == "Final"]
+    except Exception as e:
+        print(f"[audit] schedule error: {e}")
+        return results
+
+    for game_pk in game_pks:
+        try:
+            r = requests.get(
+                f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live",
+                timeout=15,
+            )
+            r.raise_for_status()
+            live = r.json()
+            all_plays = live.get("liveData", {}).get("plays", {}).get("allPlays", [])
+            for play in all_plays:
+                for ev in play.get("playEvents", []):
+                    # Offensive substitutions show up as player-change events.
+                    details = ev.get("details", {})
+                    desc = (details.get("description") or "").lower()
+                    is_sub = ev.get("isSubstitution", False) or details.get("event") == "Offensive Substitution"
+                    if is_sub and "pinch-hitter" in desc:
+                        # description e.g. "Offensive Substitution: Pinch-hitter Luis Lara replaces Sal Frelick."
+                        m = re.search(r"pinch-hitter\s+(.+?)\s+replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
+                        player = m.group(1).strip() if m else None
+                        when = None
+                        tstr = ev.get("startTime") or play.get("about", {}).get("startTime")
+                        if tstr:
+                            try:
+                                when = datetime.fromisoformat(tstr.replace("Z", "+00:00"))
+                            except Exception:
+                                when = None
+                        if player:
+                            results.append({
+                                "player":  player.title(),
+                                "game_pk": game_pk,
+                                "when_utc": when,
+                            })
+        except Exception as e:
+            print(f"[audit] game {game_pk} error: {e}")
+    return results
+
+def search_recent_tweets(player_name, when_utc):
+    """Medium-breadth recent search: player name + pinch/hit/PH terms, bounded
+    to a small window and low max_results to protect quota. Returns list of
+    {text, handle, created_at}."""
+    query = f'"{player_name}" (pinch OR "pinch hit" OR "pinch-hit" OR PH OR "hit for") -is:retweet lang:en'
+    params = {
+        "query":        query,
+        "max_results":  max(10, min(AUDIT_SEARCH_MAX, 100)),  # API min is 10
+        "tweet.fields": "created_at,author_id,text",
+        "expansions":   "author_id",
+        "user.fields":  "username",
+    }
+    if when_utc:
+        start = when_utc.astimezone(timezone.utc) - timedelta(minutes=AUDIT_WINDOW_MIN)
+        end   = when_utc.astimezone(timezone.utc) + timedelta(minutes=AUDIT_WINDOW_MIN)
+        # recent search only covers last 7 days; guard anyway
+        params["start_time"] = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["end_time"]   = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        r = requests.get(
+            "https://api.twitter.com/2/tweets/search/recent",
+            headers=TWITTER_HEADERS, params=params, timeout=15,
+        )
+        if r.status_code == 429:
+            print("[audit] search 429 — quota/rate limited, skipping remaining searches")
+            return "RATE_LIMITED"
+        r.raise_for_status()
+        body = r.json()
+        users = {u["id"]: u["username"]
+                 for u in body.get("includes", {}).get("users", [])}
+        out = []
+        for t in body.get("data", []):
+            out.append({
+                "text":       t.get("text", ""),
+                "handle":     users.get(t.get("author_id", ""), "unknown"),
+                "created_at": t.get("created_at"),
+            })
+        # Cap to AUDIT_SEARCH_MAX even if API floor returned more
+        return out[:AUDIT_SEARCH_MAX]
+    except Exception as e:
+        print(f"[audit] search error for {player_name}: {e}")
+        return []
+
+def claude_audit_why_missed(player_name, tweets, callback):
+    """Ask Claude whether any tweet was a catchable pre-event alert. Returns via
+    callback(verdict_text, catchable_bool, catchable_indices). Cheap (one Haiku
+    call per missed player)."""
+    if not ANTHROPIC_API_KEY or not tweets:
+        callback("No tweets found." if not tweets else "No API key.", False, [])
+        return
+    joined = "\n".join(f'[{i}] @{t["handle"]} ({t.get("created_at","?")}): {t["text"][:220]}'
+                       for i, t in enumerate(tweets[:AUDIT_SEARCH_MAX]))
+    system = (
+        "You audit an MLB pinch-hit alert bot's recall. The bot alerts on tweets "
+        "that announce a pinch hit BEFORE the at-bat happens. You're given the "
+        "official pinch hitter's name and tweets found afterward mentioning them, "
+        "each with an index [N]. Decide whether at least one tweet was a CATCHABLE "
+        "pre-event announcement (a real, specific, pre-at-bat pinch-hit statement a "
+        "well-tuned bot could have alerted on). "
+        'Respond with ONLY a JSON object, no markdown: '
+        '{"catchable": true/false, "catchable_indices": [list of tweet indices '
+        'that were catchable pre-event], "explanation": "2-3 sentence summary — '
+        'if catchable, quote the key phrasing; if not, say why (all post-event, '
+        'none specific, etc.)"}'
+    )
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001",
+                  "max_tokens": 250,
+                  "system": system,
+                  "messages": [{"role": "user",
+                                "content": f"Pinch hitter: {player_name}\nTweets found:\n{joined}"}]},
+            timeout=15,
+        )
+        r.raise_for_status()
+        raw = r.json()["content"][0]["text"].strip()
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"```\s*$", "", raw)
+        data = json.loads(raw)
+        callback(
+            data.get("explanation", ""),
+            bool(data.get("catchable")),
+            [i for i in data.get("catchable_indices", []) if isinstance(i, int)],
+        )
+    except Exception as e:
+        callback(f"(audit Claude error: {e})", False, [])
+
+def run_daily_audit(date_str):
+    """Full audit pass for date_str (YYYY-MM-DD). Blocking; call from a thread."""
+    print(f"[audit] Starting recall audit for {date_str}...")
+    official = fetch_official_pinch_hits(date_str)
+    if not official:
+        _audit_post(f"📋 **Recall audit {date_str}** — no final games / no official pinch hits found.")
+        return
+
+    caught, missed = [], []
+    for ph in official:
+        hit = was_fired_today(ph["player"])
+        (caught if hit else missed).append((ph, hit))
+
+    header = (
+        f"📋 **Recall Audit — {date_str}**\n"
+        f"Official pinch hits: **{len(official)}** · "
+        f"Alerted: **{len(caught)}** · Missed: **{len(missed)}**\n"
+    )
+    if caught:
+        header += "\n✅ **Caught:** " + ", ".join(
+            f"{ph['player']} ({info['path']})" for ph, info in caught) + "\n"
+    _audit_post(header)
+
+    if not missed:
+        _audit_post("🎯 No misses — full recall on today's slate.")
+        _audit_post(format_rollup_summary())
+        print("[audit] Done — full recall.")
+        return
+
+    _audit_post(f"❌ **{len(missed)} missed — investigating each below:**")
+    for ph, _ in missed:
+        player = ph["player"]
+        tweets = search_recent_tweets(player, ph.get("when_utc"))
+        if tweets == "RATE_LIMITED":
+            _audit_post(f"⏸️ **{player}** — Twitter search quota hit; stopping further searches for today.")
+            break
+        if not tweets:
+            _audit_post(f"❌ **{player}** — no tweets found in the window "
+                        f"(likely genuinely untweeted, or outside search's 7-day range).")
+            continue
+
+        block = [f"❌ **{player}** — {len(tweets)} tweet(s) found the bot didn't act on:"]
+        for t in tweets[:5]:
+            block.append(f"  • @{t['handle']}: _{t['text'][:160]}_")
+        _audit_post("\n".join(block))
+
+        done = threading.Event()
+        holder = {}
+        def cb(verdict, catchable, indices, _h=holder, _d=done):
+            _h["v"] = verdict
+            _h["catchable"] = catchable
+            _h["indices"] = indices
+            _d.set()
+        claude_audit_why_missed(player, tweets, cb)
+        done.wait(timeout=20)
+
+        verdict = holder.get("v", "(no response)")
+        catchable = holder.get("catchable", False)
+        flag = "🟠 CATCHABLE" if catchable else "⚪ not catchable"
+        _audit_post(f"🤖 **Why missed — {player}:** [{flag}] {verdict}")
+
+        # Attribute: which unpromoted phrase(s) would have caught the catchable tweets?
+        if catchable:
+            hit_phrases = set()
+            for i in holder.get("indices", []):
+                if 0 <= i < len(tweets):
+                    for p in attributable_phrases(tweets[i]["text"]):
+                        hit_phrases.add(p)
+            if hit_phrases:
+                record_phrase_attribution(list(hit_phrases), date_str)
+                _audit_post(
+                    "   ↳ would have been caught by unpromoted phrase(s): "
+                    + ", ".join(f"`{p}`" for p in sorted(hit_phrases))
+                )
+            else:
+                _audit_post(
+                    "   ↳ catchable, but no *unpromoted* phrase matched — the "
+                    "phrasing may need a brand-new rule (not just promoting an "
+                    "existing second-tier phrase). Worth a look."
+                )
+        time.sleep(1)  # gentle pacing between players
+
+    # End-of-audit: post the running promotion tracker
+    _audit_post(format_rollup_summary())
+    print("[audit] Done.")
+
+def start_audit_scheduler():
+    """Background thread that fires run_daily_audit once per day at AUDIT_HOUR_ET,
+    auditing the day that just ended."""
+    def loop():
+        global last_audit_date
+        while True:
+            try:
+                now = datetime.now(ET_TZ)
+                # audit the calendar day that just finished, once, at/after AUDIT_HOUR_ET
+                if now.hour == AUDIT_HOUR_ET:
+                    audit_for = (now.date().toordinal() - 1)
+                    audit_date = datetime.fromordinal(audit_for).strftime("%Y-%m-%d")
+                    if last_audit_date != audit_date:
+                        last_audit_date = audit_date
+                        run_daily_audit(audit_date)
+            except Exception as e:
+                print(f"[audit] scheduler error: {e}")
+            time.sleep(600)  # check every 10 min
+    threading.Thread(target=loop, daemon=True).start()
+    print(f"[audit] Scheduler started — runs daily ~{AUDIT_HOUR_ET}:00 ET\n")
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.2")
+    print("⚾ MLB Pinch Hit Bot v17.3")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
     print("   📏 Every alert logs pipeline latency (now - tweet.created_at)")
+    print("   📋 End-of-day recall audit vs official MLB pinch hits (misses only)")
     print(f"   {len(REPORTERS)} reporters tracked | game hours 12pm-1am ET\n")
 
     if not TWITTER_BEARER_TOKEN:
@@ -1045,13 +1467,27 @@ def run():
               "non-reporter alerts disabled")
     if not DISCORD_LOG_WEBHOOK:
         print("[warning] DISCORD_LOG_WEBHOOK_URL not set — drop logging skipped")
+    if not DISCORD_AUDIT_WEBHOOK:
+        print("[warning] DISCORD_AUDIT_WEBHOOK_URL not set — recall audit will fall "
+              "back to the log webhook (or console if neither is set)")
 
     start_lineup_refresh_thread()
     prefetch_full_rosters()
+    start_audit_scheduler()
     time.sleep(5)
 
     setup_stream_rules()
     run_stream()
 
 if __name__ == "__main__":
-    run()
+    import sys
+    if len(sys.argv) >= 3 and sys.argv[1] == "--audit":
+        # Manual one-off audit of a given date, no stream. e.g.:
+        #   python3 pinch_hit_bot_v17_2.py --audit 2026-07-17
+        # NOTE: fire-log is in-memory, so a manual run on a past date will show
+        # everything as "missed" (nothing was recorded as caught in this fresh
+        # process). Use it to sanity-check the official-PH pull + search + Claude
+        # steps, not the caught/missed split.
+        run_daily_audit(sys.argv[2])
+    else:
+        run()
