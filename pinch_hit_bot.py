@@ -1,5 +1,16 @@
 """
-MLB Pinch Hit Alert Bot — v17.3
+MLB Pinch Hit Alert Bot — v17.4
+
+Changes from v17.3:
+- STREAM RULES (via recall audit): added "to pinch hit" (live). The 2026-07-18
+  audit flagged a missed Jarren Duran pinch hit where a reporter wrote
+  "...to pinch hit here for Jones" — the word "here" split the contiguous
+  "pinch hit for" match. "to pinch hit" alone would have caught that miss.
+- WATCH (tracked, not live): "will hit for" was left OUT of live rules and
+  instead added to UNPROMOTED_PHRASES so future audits count how often it
+  appears in genuinely catchable misses (Claude-confirmed) before committing.
+  Reason: "will hit for power/average" is common chatter; the tracker measures
+  real-catch rate so promotion is evidence-based. Total live stream rules: 16.
 
 Changes from v17.2:
 - RECALL AUDIT: New end-of-day job (runs ~AUDIT_HOUR_ET, default 3am ET) that
@@ -220,6 +231,15 @@ STREAM_RULES = [
     {"value": '"pinch-hitting for" -is:retweet lang:en',      "tag": "pinch_hitting_for_hyph"},
     {"value": '"will be ph for" -is:retweet lang:en',         "tag": "will_be_ph_for"},
     {"value": '"coming up to hit for" -is:retweet lang:en',   "tag": "coming_up_to_hit_for"},
+    # v17.4: surfaced by the recall audit (missed Jarren Duran, 2026-07-18).
+    # "to pinch hit" catches cases where a word splits "pinch hit ... for"
+    #   (e.g. "will go with Duran to pinch hit here for Jones") — safe, since
+    #   "pinch hit" is already a specific baseball term. This alone would have
+    #   caught the 2026-07-18 miss.
+    # ("will hit for" was considered but left OUT of live rules — instead it's
+    #  in the audit's WATCH tracker to measure how often it'd catch a real sub
+    #  before committing to the noise. See UNPROMOTED_PHRASES.)
+    {"value": '"to pinch hit" -is:retweet lang:en',           "tag": "to_pinch_hit"},
 ]
 
 # ── CHEAP STRING PRE-FILTERS (run before Claude to save API calls) ────────────
@@ -258,6 +278,7 @@ PINCH_HIT_PHRASES_LOWER = [
     "hitting in place of", "batting for",
     "up to hit for", "in to hit for",
     "called upon to hit for", "coming up to hit for",
+    "to pinch hit", "will hit for",   # v17.4: 'to pinch hit' live; 'will hit for' tracked-only (see UNPROMOTED_PHRASES)
 ]
 
 def has_core_phrase(text):
@@ -276,6 +297,9 @@ UNPROMOTED_PHRASES = {
     "in to hit for":   "medium",
     "batting for":     "high",   # common English idiom ("batting for the team")
     "ph for":          "high",   # collides with pH / unrelated short strings
+    "will hit for":    "medium", # v17.4: WATCH — "will hit for power/average" is
+                                 # chatter, but "will hit for [Name]" is a real sub.
+                                 # Tracked (not live) to measure real-catch rate first.
 }
 
 # Phrases that ARE live stream rules (derived from PINCH_HIT_PHRASES_LOWER minus
@@ -1446,7 +1470,7 @@ def start_audit_scheduler():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.3")
+    print("⚾ MLB Pinch Hit Bot v17.4")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
