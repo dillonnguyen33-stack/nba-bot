@@ -1,5 +1,18 @@
 """
-MLB Pinch Hit Alert Bot — v17.4
+MLB Pinch Hit Alert Bot — v17.5
+
+Changes from v17.4:
+- BUGFIX (false rejects): result_comes_after_ph and has_reject_phrase now match
+  on WORD BOUNDARIES instead of raw substrings. The old substring match killed
+  valid alerts whose player names contained a keyword substring — e.g. "Corbin"
+  contains "rbi", so "Barrosa is pinch hitting for Corbin Carroll..." was wrongly
+  dropped as "already happened". This class of bug silently ate every pre-event
+  tweet involving affected names. Verified real already-happened tweets are still
+  caught.
+- CLAUDE EXAMPLES: added valid/boundary cases to the classifier prompt, most
+  importantly that a past-tense clause explaining WHY a sub happens ("grimaced
+  after a swing in his last AB", "left the game") does NOT make the sub itself
+  past-tense. Sharpens the pre-event vs already-happened boundary.
 
 Changes from v17.3:
 - STREAM RULES (via recall audit): added "to pinch hit" (live). The 2026-07-18
@@ -319,8 +332,11 @@ def attributable_phrases(text):
 
 def has_reject_phrase(text):
     tl = normalize(text)
+    # v17.5: word-boundary match (same fix as result_comes_after_ph). Prevents
+    # short reject words like "minors"/"college"/"pinched" from matching as
+    # substrings inside player names or unrelated words and killing valid alerts.
     for phrase in REJECT_PHRASES:
-        if phrase in tl:
+        if re.search(r'\b' + re.escape(phrase) + r'\b', tl):
             return True, phrase
     return False, None
 
@@ -342,7 +358,15 @@ def result_comes_after_ph(text):
     if ph_pos == -1:
         return False
     after_text = tl[ph_pos:]
-    return any(word in after_text for word in RESULT_WORDS)
+    # v17.5: word-boundary match, NOT raw substring. Previously "rbi" matched
+    # inside "Corbin", "scored" could match inside longer tokens, etc. — killing
+    # valid pre-event alerts whose player names happened to contain a result
+    # word as a substring. Multi-word result phrases ("struck out") are matched
+    # as phrases with boundaries on each end.
+    for word in RESULT_WORDS:
+        if re.search(r'\b' + re.escape(word) + r'\b', after_text):
+            return True
+    return False
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 seen_tweet_ids       = set()
@@ -673,6 +697,11 @@ Extract real player names even from complex sentence structures. Examples:
 - "warming up to pinch hit for Leon" → is_valid: true (imminent pre-event)
 - "Tonight Brian returns to pinch-hit for Laura on the IngrahamAngle" → is_valid: false (not baseball)
 - "pinch hit for Lutterman… #Hokies" → is_valid: false (college baseball)
+- "Barrosa is pinch hitting for Corbin Carroll who grimaced after a swing in his last AB" → pinch_hitter: "Barrosa", replaced: "Corbin Carroll", is_valid: true (the past-tense clause "grimaced...last AB" explains WHY the sub is happening; it does NOT mean the pinch-hit at-bat already occurred — the sub itself is present/imminent)
+- "Will go with Duran to pinch hit here for Jones vs the righty" → pinch_hitter: "Duran", replaced: "Jones", is_valid: true (confirmed pre-event; a word between "pinch hit" and "for" does not change validity)
+- "Pinch hitter Segura, who homered earlier, is due up in the 9th" → is_valid: false (describes a player who already batted; not a new pre-event sub being announced now)
+
+IMPORTANT: A past-tense clause describing WHY a player is being replaced (injury, "grimaced", "left the game", "who struck out last inning") does NOT make the pinch-hit invalid. Judge whether the SUBSTITUTION ITSELF is pre-event (about to happen) vs already completed.
 
 For is_valid=true, both pinch_hitter and replaced must be non-null."""
 
@@ -1470,7 +1499,7 @@ def start_audit_scheduler():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.4")
+    print("⚾ MLB Pinch Hit Bot v17.5")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
