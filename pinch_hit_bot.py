@@ -1,5 +1,18 @@
 """
-MLB Pinch Hit Alert Bot — v17.5
+MLB Pinch Hit Alert Bot — v17.6
+
+Changes from v17.5:
+- FIRE-LOG NOW DISK-BACKED (fixes false "Alerted: 0" / real alerts flagged as
+  missed). The fire-log was in-memory only, so a manual `--audit` run — a
+  separate process — always saw it empty and reported everything as missed,
+  even players the live bot did alert on (e.g. Max Muncy on 2026-07-20, which
+  fired correctly but showed as a miss). It's now persisted to FIRE_LOG_PATH
+  (default fire_log.json), date-keyed by ET day with 2-day pruning, so any
+  process (live or manual audit) reads what was actually fired. was_fired_today
+  now takes the audit's date so it checks the right day.
+  NOTE: on ephemeral cloud filesystems, put FIRE_LOG_PATH on a persistent volume
+  if you want the live process's fires to survive a restart between game time and
+  the 3am audit.
 
 Changes from v17.4:
 - BUGFIX (false rejects): result_comes_after_ph and has_reject_phrase now match
@@ -387,37 +400,72 @@ recent_fired_events  = {}
 _events_lock         = threading.Lock()
 
 # v17.3: minimal fire-log — just the info the end-of-day audit needs to know
-# which pinch hits the bot actually alerted on today. Keyed by pinch-hitter
-# last name (matches how MLB play-by-play will be normalized during audit).
+# which pinch hits the bot actually alerted on today.
+# v17.6: now DISK-BACKED and date-keyed. Previously in-memory only, so a manual
+# `--audit` run (a separate process) always saw an empty log and reported
+# "Alerted: 0" — flagging real alerts (e.g. Max Muncy) as missed. Persisting to
+# disk lets the audit read what the live bot actually fired, regardless of
+# process. Keyed by ET date so each day is isolated and stale days don't leak in.
 fired_today          = {}   # last_name -> {"handle","full_name","time","path"}
 _fired_log_lock      = threading.Lock()
 last_audit_date      = None
+FIRE_LOG_PATH        = os.environ.get("FIRE_LOG_PATH", "fire_log.json")
 
 TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
     "Content-Type":  "application/json",
 }
 
+def _today_et_str():
+    return datetime.now(ET_TZ).strftime("%Y-%m-%d")
+
+def _load_fire_log():
+    """Returns {date_str: {last_name: {...}}}. Empty dict if missing/corrupt."""
+    try:
+        with open(FIRE_LOG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_fire_log(data):
+    try:
+        with open(FIRE_LOG_PATH, "w") as f:
+            json.dump(data, f, default=str)
+    except Exception as e:
+        print(f"[fire-log save error] {e}")
+
 def record_fire(full_name, handle, path):
     """path: 'reporter' or 'general'. Records that the bot alerted on this
-    pinch hitter today, for the recall audit to check against."""
+    pinch hitter today, for the recall audit to check against. Disk-backed so
+    a separate audit process can read it."""
     if not full_name:
         return
     key = strip_suffix(full_name).split()[-1]
+    day = _today_et_str()
     with _fired_log_lock:
-        fired_today[key] = {
+        data = _load_fire_log()
+        # prune anything older than ~2 days so the file stays small
+        cutoff = (datetime.now(ET_TZ) - timedelta(days=2)).strftime("%Y-%m-%d")
+        data = {d: v for d, v in data.items() if d >= cutoff}
+        day_map = data.setdefault(day, {})
+        day_map[key] = {
             "handle":    handle,
             "full_name": full_name,
             "time":      time.time(),
             "path":      path,
         }
+        _save_fire_log(data)
+        fired_today[key] = day_map[key]  # keep in-memory copy in sync too
 
-def was_fired_today(full_name):
+def was_fired_today(full_name, date_str=None):
+    """Check whether the bot alerted on this pinch hitter on date_str (default:
+    today ET). Reads from disk so it works from a separate audit process."""
     if not full_name:
         return None
     key = strip_suffix(full_name).split()[-1]
-    with _fired_log_lock:
-        return fired_today.get(key)
+    day = date_str or _today_et_str()
+    data = _load_fire_log()
+    return data.get(day, {}).get(key)
 
 # ── GAME HOURS / RESET ────────────────────────────────────────────────────────
 def is_game_hours():
@@ -1400,7 +1448,7 @@ def run_daily_audit(date_str):
 
     caught, missed = [], []
     for ph in official:
-        hit = was_fired_today(ph["player"])
+        hit = was_fired_today(ph["player"], date_str)
         (caught if hit else missed).append((ph, hit))
 
     header = (
@@ -1499,7 +1547,7 @@ def start_audit_scheduler():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.5")
+    print("⚾ MLB Pinch Hit Bot v17.6")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
