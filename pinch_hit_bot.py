@@ -1,5 +1,20 @@
 """
-MLB Pinch Hit Alert Bot — v17.6
+MLB Pinch Hit Alert Bot — v17.7
+
+Changes from v17.6:
+- LATENCY INSTRUMENTATION: every alert now separates OUR processing time from
+  Twitter's stream-delivery lag. A timestamp is captured the instant a tweet
+  arrives off the stream (before any processing); when the Discord POST
+  completes we log:
+      total (now - tweet.created_at) = twitter-delivery + internal
+  Console line: "[reporter] @X: total 6.40s = twitter-delivery ~5.80s + internal 0.60s"
+  Plus a threaded "Timing breakdown" reply on each alert.
+  WHY: the existing single number bundled both, so it was impossible to tell
+  whether 5-6s alerts were our code or Twitter. If internal is consistently
+  <1s, the bottleneck is Twitter delivery and no code change will help; if it's
+  2-3s, something in our pipeline is worth fixing. Note the general path's
+  internal time INCLUDES the Claude round-trip (Claude is on the critical path
+  for non-reporters); the reporter path's does not.
 
 Changes from v17.5:
 - FIRE-LOG NOW DISK-BACKED (fixes false "Alerted: 0" / real alerts flagged as
@@ -923,13 +938,39 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
     threading.Thread(target=_run, daemon=True).start()
 
 # ── ALERT SENDERS ─────────────────────────────────────────────────────────────
-def post_reporter_alert_fast(handle, text, url, team, latency):
+# ── LATENCY INSTRUMENTATION (v17.7) ───────────────────────────────────────────
+# The existing "fired Xs after tweet" number = now - tweet.created_at, which
+# BUNDLES Twitter's stream-delivery lag with our own processing. These helpers
+# separate the two:
+#   internal = tweet received off stream -> Discord POST completed  (OUR time)
+#   twitter  = total - internal                                     (THEIR time)
+# If internal is consistently <1s, the bottleneck is Twitter delivery and no
+# code change will help. If internal is 2-3s, something in our pipeline is slow.
+def _log_timing(path, handle, total, internal):
+    if internal is None:
+        return
+    if total is not None:
+        twitter = max(0.0, total - internal)
+        print(f"  ⏱️  [{path}] @{handle}: total {total:.2f}s = "
+              f"twitter-delivery ~{twitter:.2f}s + internal {internal:.2f}s")
+    else:
+        print(f"  ⏱️  [{path}] @{handle}: internal {internal:.2f}s (total n/a)")
+
+def post_reporter_alert_fast(handle, text, url, team, latency, recv_t=None):
     """v17: Fire the reporter alert IMMEDIATELY (trusted source, cheap filters
     already passed). Claude runs ASYNC only to fill in the structured names or
     retract if it turns out invalid — it is NOT on the critical path."""
+    # v17.7: internal time measured here, just before the POST. Captures stream
+    # receive -> filters -> now. (Excludes the POST round-trip itself, which the
+    # footer can't know since it's built before posting.)
+    internal = (time.monotonic() - recv_t) if recv_t is not None else None
     footer = f"Beat Reporter · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     if latency is not None:
         footer += f" · fired {latency:.1f}s after tweet"
+        if internal is not None:
+            footer += f" ({max(0.0, latency - internal):.1f}s twitter + {internal:.1f}s bot)"
+    elif internal is not None:
+        footer += f" · {internal:.1f}s bot"
     embed_payload = {
         "content": "@everyone 🔥 BEAT REPORTER",
         "embeds": [{"title": f"🔥⚾ BEAT REPORTER ALERT — {team}",
@@ -944,6 +985,7 @@ def post_reporter_alert_fast(handle, text, url, team, latency):
 
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
+        _log_timing("reporter", handle, latency, internal)
 
         def on_claude(is_valid, ph, out, reason):
             if is_valid and ph and out:
@@ -961,11 +1003,18 @@ def post_reporter_alert_fast(handle, text, url, team, latency):
     threading.Thread(target=_send, daemon=True).start()
     print(f"  ⚡🟢 Reporter (fast fire): {team} — @{handle} | latency {_latency_str(latency)}")
 
-def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=None, event_key=None):
+def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=None, event_key=None, recv_t=None):
     summary = f"**{pinch_hitter}** will pinch hit for **{replaced}**"
+    # v17.7: internal time measured before the POST. On this path it INCLUDES
+    # the Claude round-trip, since Claude gates non-reporter alerts.
+    internal = (time.monotonic() - recv_t) if recv_t is not None else None
     footer = f"General Alert · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     if latency is not None:
         footer += f" · fired {latency:.1f}s after tweet"
+        if internal is not None:
+            footer += f" ({max(0.0, latency - internal):.1f}s twitter + {internal:.1f}s bot)"
+    elif internal is not None:
+        footer += f" · {internal:.1f}s bot"
     embed_payload = {
         "content": "@everyone",
         "embeds": [{"title": f"⚾🚨 PINCH HIT ALERT — {team}",
@@ -980,6 +1029,7 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=
     }
     def _send():
         msg_id = _post_discord_now(embed_payload, return_msg_id=True)
+        _log_timing("general", handle, latency, internal)
         record_fire(pinch_hitter, handle, "general")
         if msg_id:
             if event_key:
@@ -1000,7 +1050,7 @@ def post_corroboration_reply(message_id, handle, text, url, pinch_hitter, replac
     print(f"  🔁 Corroboration only: @{handle} confirms {pinch_hitter} for {replaced}")
 
 # ── CORE: FIRE ALERT (non-reporters only) ─────────────────────────────────────
-def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
+def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None, recv_t=None):
     ph_team  = lookup_player_team(pinch_hitter)
     out_team = lookup_player_team(replaced)
     if not ph_team or not out_team:
@@ -1040,10 +1090,10 @@ def _fire_alert(handle, text, tid, pinch_hitter, replaced, latency=None):
     print(f"     {text[:120]}")
 
     record_player_alert(pinch_hitter)
-    post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency, event_key)
+    post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency, event_key, recv_t)
 
 # ── CORE: HANDLE SINGLE TWEET ─────────────────────────────────────────────────
-def handle_tweet(tid, text, handle, created_at=None):
+def handle_tweet(tid, text, handle, created_at=None, recv_t=None):
     maybe_reset_daily()
 
     if not is_game_hours():
@@ -1083,7 +1133,7 @@ def handle_tweet(tid, text, handle, created_at=None):
         team = reporter["team"] if reporter else (infer_team_from_text(text) or "Unknown Team")
         url  = f"https://twitter.com/{handle}/status/{tid}"
         print(f"  ⚡ FAST REPORTER FIRE: @{handle} team={team} | {text[:100]}")
-        post_reporter_alert_fast(handle, text, url, team, latency)
+        post_reporter_alert_fast(handle, text, url, team, latency, recv_t)
         return
 
     # ── NON-REPORTER: gate on Claude as before ───────────────────────────────
@@ -1094,7 +1144,7 @@ def handle_tweet(tid, text, handle, created_at=None):
 
     print(f"  🤖 Sending to Claude: @{handle} — {text[:80]}")
 
-    _tid, _text, _handle, _latency = tid, text, handle, latency
+    _tid, _text, _handle, _latency, _recv_t = tid, text, handle, latency, recv_t
 
     def on_claude_result(is_valid, ph, out, reason):
         if not is_valid:
@@ -1106,7 +1156,7 @@ def handle_tweet(tid, text, handle, created_at=None):
             post_drop_log(_handle, "Claude: valid but names unclear", _text)
             return
         print(f"  🤖 Claude extracted: ph='{ph}' out='{out}' — {reason}")
-        _fire_alert(_handle, _text, _tid, ph, out, _latency)
+        _fire_alert(_handle, _text, _tid, ph, out, _latency, _recv_t)
 
     claude_classify(text, on_claude_result)
 
@@ -1188,6 +1238,10 @@ def run_stream():
             for raw_line in connect_stream():
                 reconnect_wait = 5
                 maybe_reset_daily()
+                # v17.7: capture the instant the tweet arrives off the stream,
+                # BEFORE any processing. Everything after this point is our
+                # internal time; everything before it is Twitter's delivery lag.
+                recv_t = time.monotonic()
                 try:
                     data = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1200,6 +1254,7 @@ def run_stream():
                     tweet_data.get("text", ""),
                     users.get(tweet_data.get("author_id", ""), "unknown"),
                     tweet_data.get("created_at"),
+                    recv_t,
                 )
         except requests.exceptions.ChunkedEncodingError:
             print(f"[stream] Dropped — reconnecting in {reconnect_wait}s...")
@@ -1547,7 +1602,7 @@ def start_audit_scheduler():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.6")
+    print("⚾ MLB Pinch Hit Bot v17.7")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
     print("   ⏱️ Claude timeout 15s -> 5s")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
