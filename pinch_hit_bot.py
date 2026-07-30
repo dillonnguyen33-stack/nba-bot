@@ -1,5 +1,28 @@
 """
-MLB Pinch Hit Alert Bot — v17.7
+MLB Pinch Hit Alert Bot — v17.9
+
+Changes from v17.8:
+- LATENCY (transport): the filtered stream now requests identity encoding
+  (Accept-Encoding: identity) via a stream-only STREAM_HEADERS. On a long-lived
+  NDJSON stream, gzip means the client can't decode a tweet line until the
+  compressor flushes a block — adding buffering latency to the twitter-delivery
+  segment. Disabling it attacks that segment and costs nothing. (Search/user
+  lookups still use the normal gzipped TWITTER_HEADERS — only the stream benefits.)
+- LATENCY (discord): all Discord POST/PATCH now reuse ONE keep-alive
+  requests.Session (_discord_session), so each alert skips a fresh TLS handshake
+  (~100-300ms) to Discord instead of opening a new connection every time.
+- MEASURE: _log_timing keeps a rolling window (last 200) of the twitter-delivery
+  segment and prints min/median/max alongside each alert. This turns a
+  region/tier change into a real before/after on the DISTRIBUTION, not a single
+  noisy alert. Watch the median across a night of games.
+  NOTE: west->east region move and gzip-off both attack the twitter segment but
+  are expected to be small (~100-300ms) — the dominant ~5s is Twitter's internal
+  index->push, which no host/transport change touches. If the rolling median
+  stays flat, that's your evidence the delay is structural (and a paid API tier
+  is an unproven bet against it).
+
+Changes from v17.7:
+- (v17.8) Footer edit after POST completes to include discord-post duration.
 
 Changes from v17.6:
 - LATENCY INSTRUMENTATION: every alert now separates OUR processing time from
@@ -63,7 +86,7 @@ Changes from v17.2:
   alert and why the live stream would have missed it. Results post to a
   dedicated audit webhook (DISCORD_AUDIT_WEBHOOK_URL), falling back to the log
   webhook. Only misses trigger a search, so cost stays low.
-  Manual run: `python3 pinch_hit_bot_v17_2.py --audit YYYY-MM-DD`
+  Manual run: `python3 pinch_hit_bot_v17_9.py --audit YYYY-MM-DD`
 - FIRE-LOG: minimal record_fire/was_fired_today added at both fire points so the
   audit knows what was caught. Cleared on daily reset.
 - PHRASE TRACKER: for each catchable miss, the audit attributes which *unpromoted*
@@ -111,6 +134,8 @@ import json
 import threading
 import unicodedata
 import requests
+import statistics
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -430,6 +455,26 @@ TWITTER_HEADERS = {
     "Authorization": f"Bearer {TWITTER_BEARER_TOKEN}",
     "Content-Type":  "application/json",
 }
+
+# v17.9: stream-only headers. Accept-Encoding: identity disables gzip on the
+# long-lived NDJSON filtered stream so tweet lines aren't held in a gzip
+# decompression buffer before we can read them off the socket. Do NOT reuse this
+# for search/user-lookup calls — only the persistent stream benefits, and those
+# one-shot calls are perfectly fine gzipped.
+STREAM_HEADERS = {
+    "Authorization":   f"Bearer {TWITTER_BEARER_TOKEN}",
+    "Accept-Encoding": "identity",
+}
+
+# v17.9: single keep-alive session reused for ALL Discord POST/PATCH calls, so
+# each alert reuses the warm TLS connection instead of paying a fresh handshake
+# (~100-300ms) to Discord on every post.
+_discord_session = requests.Session()
+
+# v17.9: rolling window (last 200) of the twitter-delivery segment in seconds,
+# so _log_timing can print min/median/max. Lets a region/tier change be judged
+# on the distribution, not one noisy alert.
+_twitter_seg = deque(maxlen=200)
 
 def _today_et_str():
     return datetime.now(ET_TZ).strftime("%Y-%m-%d")
@@ -808,19 +853,41 @@ def claude_classify(tweet_text, callback):
     threading.Thread(target=_run, daemon=True).start()
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
-def _post_discord_now(payload, return_msg_id=False):
+def _edit_footer_with_post_time(message_id, embed_payload, post_dur):
+    """v17.8: after the POST completes we finally know the discord-post duration.
+    Patch the alert's footer so the visible number includes it (the footer was
+    built before the POST and couldn't know it). Best-effort; skips silently if
+    it can't. Does NOT delay the alert — the alert is already visible; this only
+    refines the footer a fraction of a second later."""
+    if not (message_id and DISCORD_WEBHOOK_URL and post_dur is not None):
+        return
+    try:
+        embeds = embed_payload.get("embeds", [])
+        if not embeds:
+            return
+        old = embeds[0].get("footer", {}).get("text", "")
+        embeds[0]["footer"]["text"] = old + f" + {post_dur:.1f}s discord"
+        edit_url = f"{DISCORD_WEBHOOK_URL}/messages/{message_id}"
+        _discord_session.patch(edit_url, json={"embeds": embeds}, timeout=10)  # v17.9: keep-alive session
+    except Exception as e:
+        print(f"[footer edit error] {e}")
+
+def _post_discord_now(payload, return_msg_id=False, return_timing=False):
     if not DISCORD_WEBHOOK_URL:
         print("[discord error] Webhook URL missing!")
-        return None
+        return (None, None) if return_timing else None
+    msg_id, post_dur = None, None
     try:
         url = DISCORD_WEBHOOK_URL + ("?wait=true" if return_msg_id else "")
-        r = requests.post(url, json=payload, timeout=10)
+        _t0 = time.monotonic()
+        r = _discord_session.post(url, json=payload, timeout=10)  # v17.9: keep-alive session
+        post_dur = time.monotonic() - _t0
         r.raise_for_status()
         if return_msg_id:
-            return r.json().get("id")
+            msg_id = r.json().get("id")
     except Exception as e:
         print(f"[discord error] {e}")
-    return None
+    return (msg_id, post_dur) if return_timing else msg_id
 
 def post_discord(payload):
     threading.Thread(target=_post_discord_now, args=(payload,), daemon=True).start()
@@ -838,7 +905,7 @@ def _post_reply(message_id, content):
         },
     }
     try:
-        requests.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10)
+        _discord_session.post(DISCORD_WEBHOOK_URL + "?wait=true", json=payload, timeout=10)  # v17.9: keep-alive session
     except Exception as e:
         print(f"[reply error] {e}")
 
@@ -946,15 +1013,23 @@ def post_followup_reply(message_id, handle, is_reporter, team, pinch_hitter, rep
 #   twitter  = total - internal                                     (THEIR time)
 # If internal is consistently <1s, the bottleneck is Twitter delivery and no
 # code change will help. If internal is 2-3s, something in our pipeline is slow.
-def _log_timing(path, handle, total, internal):
+def _log_timing(path, handle, total, internal, post_dur=None):
     if internal is None:
         return
+    post_str = f" + {post_dur:.2f}s discord-post" if post_dur is not None else ""
     if total is not None:
         twitter = max(0.0, total - internal)
-        print(f"  ⏱️  [{path}] @{handle}: total {total:.2f}s = "
-              f"twitter-delivery ~{twitter:.2f}s + internal {internal:.2f}s")
+        # v17.9: track rolling distribution of the twitter-delivery segment so a
+        # region/tier/gzip change can be judged on min/median/max, not one alert.
+        _twitter_seg.append(twitter)
+        roll = (f" | twitter rolling n={len(_twitter_seg)} "
+                f"min {min(_twitter_seg):.1f}/med {statistics.median(_twitter_seg):.1f}/"
+                f"max {max(_twitter_seg):.1f}s")
+        e2e = total + (post_dur or 0.0)
+        print(f"  ⏱️  [{path}] @{handle}: ~{e2e:.2f}s end-to-end "
+              f"(twitter ~{twitter:.2f}s + bot {internal:.2f}s{post_str}){roll}")
     else:
-        print(f"  ⏱️  [{path}] @{handle}: internal {internal:.2f}s (total n/a)")
+        print(f"  ⏱️  [{path}] @{handle}: internal {internal:.2f}s{post_str} (total n/a)")
 
 def post_reporter_alert_fast(handle, text, url, team, latency, recv_t=None):
     """v17: Fire the reporter alert IMMEDIATELY (trusted source, cheap filters
@@ -984,8 +1059,9 @@ def post_reporter_alert_fast(handle, text, url, team, latency, recv_t=None):
     }
 
     def _send():
-        msg_id = _post_discord_now(embed_payload, return_msg_id=True)
-        _log_timing("reporter", handle, latency, internal)
+        msg_id, post_dur = _post_discord_now(embed_payload, return_msg_id=True, return_timing=True)
+        _log_timing("reporter", handle, latency, internal, post_dur)
+        _edit_footer_with_post_time(msg_id, embed_payload, post_dur)
 
         def on_claude(is_valid, ph, out, reason):
             if is_valid and ph and out:
@@ -1028,8 +1104,9 @@ def post_general_alert(handle, text, url, team, pinch_hitter, replaced, latency=
             "footer": {"text": footer}}]
     }
     def _send():
-        msg_id = _post_discord_now(embed_payload, return_msg_id=True)
-        _log_timing("general", handle, latency, internal)
+        msg_id, post_dur = _post_discord_now(embed_payload, return_msg_id=True, return_timing=True)
+        _log_timing("general", handle, latency, internal, post_dur)
+        _edit_footer_with_post_time(msg_id, embed_payload, post_dur)
         record_fire(pinch_hitter, handle, "general")
         if msg_id:
             if event_key:
@@ -1217,7 +1294,10 @@ def connect_stream():
         "user.fields":  "username",
     }
     print("[stream] Connecting...")
-    r = requests.get(url, headers=TWITTER_HEADERS, params=params,
+    # v17.9: STREAM_HEADERS (Accept-Encoding: identity) — no gzip buffering on
+    # the long-lived NDJSON stream, so each tweet line is readable the instant
+    # it arrives rather than waiting for a compression block to flush.
+    r = requests.get(url, headers=STREAM_HEADERS, params=params,
                      stream=True, timeout=30)
     if r.status_code == 429:
         print("[stream] 429 rate limit — waiting 5 min...")
@@ -1602,9 +1682,11 @@ def start_audit_scheduler():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def run():
-    print("⚾ MLB Pinch Hit Bot v17.7")
+    print("⚾ MLB Pinch Hit Bot v17.9")
     print("   ⚡ Reporters fire IMMEDIATELY (Claude async only for names/retract)")
-    print("   ⏱️ Claude timeout 15s -> 5s")
+    print("   🗜️ Stream requests identity encoding (no gzip buffering)")
+    print("   ♻️ Discord posts reuse one keep-alive TLS session")
+    print("   📊 Rolling min/med/max of the twitter-delivery segment per alert")
     print("   🔁 Duplicate reports of the same event now reply instead of re-alerting")
     print("   📏 Every alert logs pipeline latency (now - tweet.created_at)")
     print("   📋 End-of-day recall audit vs official MLB pinch hits (misses only)")
@@ -1639,7 +1721,7 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 3 and sys.argv[1] == "--audit":
         # Manual one-off audit of a given date, no stream. e.g.:
-        #   python3 pinch_hit_bot_v17_2.py --audit 2026-07-17
+        #   python3 pinch_hit_bot_v17_9.py --audit 2026-07-17
         # NOTE: fire-log is in-memory, so a manual run on a past date will show
         # everything as "missed" (nothing was recorded as caught in this fresh
         # process). Use it to sanity-check the official-PH pull + search + Claude
