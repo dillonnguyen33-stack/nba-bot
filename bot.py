@@ -12,16 +12,22 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "https://discordapp.
 POLL_INTERVAL_SECONDS = 10
 DB_PATH = os.environ.get("DB_PATH", "corrections.db")
 
-# Stat types to monitor
-WATCH_STATS = {"ast", "pts", "reb"}
+# A change that shows up this soon after the play was first recorded is just the
+# feed filling the play in (e.g. the assist arriving one poll after the shot),
+# not a real correction. Those are logged to the database but never posted.
+MIN_CORRECTION_SECONDS = float(os.environ.get("MIN_CORRECTION_SECONDS", "15"))
+
+# A play that vanishes from the feed is only reported as deleted once it has been
+# missing this many polls in a row, and never on a poll where more than a handful
+# of plays are missing at once (a truncated response, not real deletions).
+DELETED_AFTER_POLLS = int(os.environ.get("DELETED_AFTER_POLLS", "3"))
+TRUNCATED_FEED_MAX_MISSING = 5
 
 # Color codes for Discord embeds
 COLORS = {
     "removed": 0xE74C3C,   # red
     "added":   0x2ECC71,   # green
     "mixup":   0xF1C40F,   # yellow
-    "points":  0x9B59B6,   # purple
-    "rebound": 0x3498DB,   # blue
 }
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -105,40 +111,88 @@ def get_play_by_play(game_id):
     except Exception as e:
         print(f"[pbp error game {game_id}] {e}")
         return {}
-def classify_correction(stat, old_val, new_val, old_player, new_player):
-    if stat == "ast":
-        if old_player and not new_player:
-            return "removed", "assist removed"
-        if not old_player and new_player:
-            return "added", "assist added"
-        if old_player != new_player:
-            return "mixup", "assist mixup"
-    if stat == "pts":
-        return "points", f"points corrected ({old_val} → {new_val})"
-    if stat == "reb":
-        return "rebound", f"rebound corrected ({old_val} → {new_val})"
-    return "added", f"{stat} corrected ({old_val} → {new_val})"
+STAT_NAMES = {"ast": "assist", "reb": "rebound"}
+
+def classify_correction(stat, old_id, new_id):
+    """old_id / new_id are the player ids credited before and after (0/None = nobody)."""
+    name = STAT_NAMES[stat]
+    if old_id and not new_id:
+        return "removed", f"{name} removed"
+    if not old_id and new_id:
+        return "added", f"{name} added"
+    return "mixup", f"{name} mixup"
+
+def is_rebound(play):
+    return play.get("actionType") == "rebound"
 
 def diff_plays(old_play, new_play):
+    """Compare two versions of the same play. Returns [(stat, old_player_id, new_player_id)]."""
     diffs = []
-    for stat in WATCH_STATS:
-        old_v = old_play.get(stat)
-        new_v = new_play.get(stat)
-        if old_v != new_v:
-            diffs.append((stat, old_v, new_v))
 
-    old_ast = old_play.get("assistPersonId")
-    new_ast = new_play.get("assistPersonId")
-    if old_ast != new_ast and ("ast", old_play.get("ast"), new_play.get("ast")) not in diffs:
+    # Assist: who is credited with the assist on a made shot.
+    old_ast = old_play.get("assistPersonId") or None
+    new_ast = new_play.get("assistPersonId") or None
+    if old_ast != new_ast:
         diffs.append(("ast", old_ast, new_ast))
 
+    # Rebound: who is credited on a rebound play. Team rebounds carry player id 0,
+    # so team -> player reads as "added" and player -> team as "removed".
+    if is_rebound(old_play) or is_rebound(new_play):
+        old_reb = (old_play.get("personId") or None) if is_rebound(old_play) else None
+        new_reb = (new_play.get("personId") or None) if is_rebound(new_play) else None
+        if old_reb != new_reb:
+            diffs.append(("reb", old_reb, new_reb))
+
     return diffs
+
+def credits_lost_if_deleted(play):
+    """What a play credits, as [(stat, player_id)], i.e. what is taken away if the
+    play is deleted from the feed outright."""
+    lost = []
+    if play.get("assistPersonId"):
+        lost.append(("ast", play["assistPersonId"]))
+    if is_rebound(play) and play.get("personId"):
+        lost.append(("reb", play["personId"]))
+    return lost
+
+def find_deleted_plays(old_snap, plays, missing, now):
+    """Track plays that have dropped out of the feed. `missing` maps play id ->
+    (polls missing, time first missing) and is updated in place. Returns the ids
+    that have now been gone DELETED_AFTER_POLLS polls in a row."""
+    for pid in list(missing):
+        if pid in plays:
+            del missing[pid]  # it came back; it was a feed hiccup
+    if sum(1 for pid in old_snap if pid not in plays) > TRUNCATED_FEED_MAX_MISSING:
+        missing.clear()
+        return []
+    deleted = []
+    for pid, (old_play, _first_seen, _polls) in old_snap.items():
+        if pid in plays or not credits_lost_if_deleted(old_play):
+            continue
+        count, since = missing.get(pid, (0, now))
+        count += 1
+        missing[pid] = (count, since)
+        if count >= DELETED_AFTER_POLLS:
+            deleted.append(pid)
+    return deleted
+
+def too_fast(elapsed, polls_seen):
+    """True if the change arrived on the very next poll after the play first
+    appeared, or inside MIN_CORRECTION_SECONDS. That is feed lag, not a correction."""
+    return polls_seen <= 1 or elapsed < MIN_CORRECTION_SECONDS
 def ordinal(n):
     return {1:"1st", 2:"2nd", 3:"3rd", 4:"4th"}.get(n, f"{n}th")
 
 def dot_color(ctype):
-    return {"removed": "🔴", "added": "🟢", "mixup": "🟡",
-            "points": "🟣", "rebound": "🔵"}.get(ctype, "⚪")
+    return {"removed": "🔴", "added": "🟢", "mixup": "🟡"}.get(ctype, "⚪")
+
+def credited_name(play, stat):
+    """Name of the player a play credits with the assist / rebound, or None."""
+    if stat == "ast":
+        return play.get("assistPlayerNameInitial") or None
+    if is_rebound(play) and play.get("personId"):
+        return play.get("playerNameI") or None
+    return None
 
 def post_to_discord(game, play, old_play, correction_type, label, stat,
                     old_val, new_val, seconds_elapsed):
@@ -146,24 +200,23 @@ def post_to_discord(game, play, old_play, correction_type, label, stat,
     clock      = play.get("clock", "").replace("PT","").replace("M","m ").replace("S","s")
     game_code  = game.get("gameCode", "?").replace("/", " vs ")
     play_num   = play.get("actionNumber", "?")
-    player     = play.get("playerNameI", "Unknown")
     desc       = play.get("description", "")
 
-    if stat == "ast":
-        if correction_type == "mixup":
-            old_name = old_play.get("assistPlayerNameInitial") or str(old_val) or "none"
-            new_name = play.get("assistPlayerNameInitial") or str(new_val) or "none"
-            change_line = f"❌ Taken from: **{old_name}**\n✅ Given to: **{new_name}**"
-        elif correction_type == "removed":
-            old_name = old_play.get("assistPlayerNameInitial") or str(old_val) or "none"
-            change_line = f"❌ Removed from: **{old_name}**"
-        elif correction_type == "added":
-            new_name = play.get("assistPlayerNameInitial") or str(new_val) or "none"
-            change_line = f"✅ Added to: **{new_name}**"
-        else:
-            change_line = f"{old_val} → {new_val}"
+    old_name = credited_name(old_play, stat) or str(old_val or "none")
+    new_name = credited_name(play, stat) or str(new_val or "none")
+    if stat == "reb":
+        # Headline the player whose rebound count changed; team rebounds have no name.
+        player = (credited_name(play, stat) or credited_name(old_play, stat)
+                  or play.get("teamTricode") or "Team")
     else:
-        change_line = f"{old_val} → {new_val}"
+        player = play.get("playerNameI", "Unknown")
+
+    if correction_type == "mixup":
+        change_line = f"❌ Taken from: **{old_name}**\n✅ Given to: **{new_name}**"
+    elif correction_type == "removed":
+        change_line = f"❌ Removed from: **{old_name}**"
+    else:
+        change_line = f"✅ Added to: **{new_name}**"
 
     mins = int(seconds_elapsed // 60)
     secs = int(seconds_elapsed % 60)
@@ -194,6 +247,7 @@ def run():
           f"{POLL_INTERVAL_SECONDS}s for live games...\n")
 
     snapshots = {}
+    missing = {}  # game_id -> {play id: (polls missing, time first missing)}
 
     while True:
         live_games = get_live_scoreboard()
@@ -214,7 +268,7 @@ def run():
                 continue
 
             if game_id not in snapshots:
-                snapshots[game_id] = {pid: (p, time.time()) for pid, p in plays.items()}
+                snapshots[game_id] = {pid: (p, time.time(), 0) for pid, p in plays.items()}
                 print(f"  Tracking new game: {game_code} ({len(plays)} plays)")
                 continue
 
@@ -222,10 +276,11 @@ def run():
 
             for pid, new_play in plays.items():
                 if pid not in old_snap:
-                    old_snap[pid] = (new_play, time.time())
+                    old_snap[pid] = (new_play, time.time(), 0)
                     continue
 
-                old_play, first_seen = old_snap[pid]
+                old_play, first_seen, polls_seen = old_snap[pid]
+                polls_seen += 1
                 diffs = diff_plays(old_play, new_play)
 
                 for (stat, old_v, new_v) in diffs:
@@ -234,10 +289,7 @@ def run():
                     if already_reported(correction_key):
                         continue
 
-                    old_player = old_play.get("assistPlayerNameInitial")
-                    new_player = new_play.get("assistPlayerNameInitial")
-                    ctype, label = classify_correction(stat, old_v, new_v,
-                                                       old_player, new_player)
+                    ctype, label = classify_correction(stat, old_v, new_v)
                     elapsed = time.time() - first_seen
                     # This guarantees no duplicates even if bot crashes mid-post
                     saved = save_correction(
@@ -256,13 +308,52 @@ def run():
                         # Already in database — skip posting
                         continue
 
+                    if too_fast(elapsed, polls_seen):
+                        print(f"  (skipped, feed lag {elapsed:.0f}s) "
+                              f"{new_play.get('playerNameI','?')} — {label} ({game_code})")
+                        continue
+
                     print(f"  ✅ CORRECTION: {new_play.get('playerNameI','?')} "
                           f"— {label} ({game_code})")
 
                     post_to_discord(game, new_play, old_play, ctype, label,
                                     stat, old_v, new_v, elapsed)
 
-                old_snap[pid] = (new_play, first_seen)
+                old_snap[pid] = (new_play, first_seen, polls_seen)
+
+            # Plays deleted from the feed outright: whoever they credited loses it.
+            game_missing = missing.setdefault(game_id, {})
+            for pid in find_deleted_plays(old_snap, plays, game_missing, time.time()):
+                old_play, first_seen, polls_seen = old_snap.pop(pid)
+                _, missing_since = game_missing.pop(pid)
+                elapsed = missing_since - first_seen
+
+                for (stat, old_v) in credits_lost_if_deleted(old_play):
+                    label = f"{STAT_NAMES[stat]} removed (play deleted)"
+                    saved = save_correction(
+                        game_id, pid,
+                        old_play.get("playerNameI", "?"),
+                        stat, old_v, None,
+                        old_play.get("description", ""),
+                        old_play.get("period", 0),
+                        old_play.get("clock", ""),
+                        datetime.now(timezone.utc).isoformat(),
+                        elapsed,
+                        f"{game_id}_{pid}_{stat}_{old_v}_deleted"
+                    )
+                    if not saved:
+                        continue
+
+                    if too_fast(elapsed, polls_seen + 1):
+                        print(f"  (skipped, feed lag {elapsed:.0f}s) "
+                              f"{old_play.get('playerNameI','?')} — {label} ({game_code})")
+                        continue
+
+                    print(f"  ✅ CORRECTION: {old_play.get('playerNameI','?')} "
+                          f"— {label} ({game_code})")
+
+                    post_to_discord(game, old_play, old_play, "removed", label,
+                                    stat, old_v, None, elapsed)
 
             snapshots[game_id] = old_snap
 
