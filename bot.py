@@ -88,12 +88,35 @@ HEADERS = {
     "Accept":     "application/json",
 }
 
+# Where the live data files are served from. cdn.nba.com started answering 403
+# (Access Denied), so the storage bucket behind it is tried first; whichever
+# source last worked is tried first on the next request.
+FEED_BASES = [
+    "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData",
+    "https://cdn.nba.com/static/json/liveData",
+]
+
+def fetch_feed(path):
+    """GET a live-data file, falling back across FEED_BASES. Raises if all fail."""
+    last_error = None
+    for base in list(FEED_BASES):
+        try:
+            r = requests.get(f"{base}/{path}", headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            last_error = e
+            continue
+        if FEED_BASES[0] != base:
+            FEED_BASES.remove(base)
+            FEED_BASES.insert(0, base)
+            print(f"[feed] now using {base}")
+        return data
+    raise last_error
+
 def get_live_scoreboard():
-    url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        data = fetch_feed("scoreboard/todaysScoreboard_00.json")
         games = data.get("scoreboard", {}).get("games", [])
         return [g for g in games if g.get("gameStatus") == 2]
     except Exception as e:
@@ -101,11 +124,8 @@ def get_live_scoreboard():
         return []
 
 def get_play_by_play(game_id):
-    url = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        data = fetch_feed(f"playbyplay/playbyplay_{game_id}.json")
         actions = data.get("game", {}).get("actions", [])
         return {str(a["actionNumber"]): a for a in actions}
     except Exception as e:
