@@ -7,6 +7,7 @@ Uses fuzzy matching for player names
 
 import os
 import re
+import unicodedata
 import requests
 import discord
 from datetime import datetime, timezone
@@ -426,17 +427,24 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
         f"{kelly_section}\n"
         f"-# QK Bot · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
+def _strip_accents(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", text) if not unicodedata.combining(c))
+
+
+_PLAYS_NAME = re.compile(r"^\d{1,2}-\d{1,2}-plays$")
+
+
 def is_plays_channel(channel) -> bool:
-    """#plays is replaced by a fresh, renamed channel every day (11-1-plays,
-    playz-11-2, ...), so match today's channel by name instead of a fixed ID.
+    """#plays is replaced every day by a channel named for the date with a
+    different accented "a" (11-1-pláys, 11-2-plàys, ...), so match today's
+    channel by its name with the accent removed instead of a fixed ID.
     Retired channels are renamed old-* and hidden; the QK channel is skipped."""
     if channel.id == PLAYS_CHANNEL_ID:
         return True
     if channel.id == QK_CHANNEL_ID:
         return False
-    name = getattr(channel, "name", "") or ""
-    category = getattr(getattr(channel, "category", None), "name", "") or ""
-    return "play" in name and not name.startswith("old-") and category.lower() != "plays archive"
+    name = _strip_accents(getattr(channel, "name", "") or "")
+    return bool(_PLAYS_NAME.match(name))
 
 
 intents = discord.Intents.default()
