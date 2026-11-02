@@ -1,6 +1,6 @@
 """
 QK Bot - Kelly Criterion Calculator for NBA Player Props
-Triggers only on @sub messages in #plays channel
+Triggers only on @sub messages in the plays channel (renamed daily, matched by name)
 Posts to #plays-qk with implied probability, EV%, and Kelly suggestion
 Uses fuzzy matching for player names
 """
@@ -426,6 +426,19 @@ def format_qk_message(play, player_data, book_odds, adj_prob, kelly_data):
         f"{kelly_section}\n"
         f"-# QK Bot · {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
     )
+def is_plays_channel(channel) -> bool:
+    """#plays is replaced by a fresh, renamed channel every day (11-1-plays,
+    playz-11-2, ...), so match today's channel by name instead of a fixed ID.
+    Retired channels are renamed old-* and hidden; the QK channel is skipped."""
+    if channel.id == PLAYS_CHANNEL_ID:
+        return True
+    if channel.id == QK_CHANNEL_ID:
+        return False
+    name = getattr(channel, "name", "") or ""
+    category = getattr(getattr(channel, "category", None), "name", "") or ""
+    return "play" in name and not name.startswith("old-") and category.lower() != "plays archive"
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -445,7 +458,7 @@ async def on_message(message):
 
     print(f"[debug] Message in channel {message.channel.id}: {repr(message.content[:80])}")
 
-    if message.channel.id != PLAYS_CHANNEL_ID:
+    if not is_plays_channel(message.channel):
         return
 
     play = parse_play(message)
